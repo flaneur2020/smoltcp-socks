@@ -1,0 +1,46 @@
+[package]
+name = "smoltcp-socks"
+version = "0.1.0"
+edition = "2024"
+description = "A userspace TCP/IP stack (smoltcp) that forwards TUN connections to a SOCKS5 proxy"
+license = "Apache-2.0"
+
+[dependencies]
+# Userspace TCP/IP stack. We use the std + async feature set: IPv4/IPv6, TCP/UDP
+# sockets, and the async waker API so each virtual connection can present an
+# AsyncRead/AsyncWrite surface without blocking the single poll loop.
+smoltcp = { version = "0.14", default-features = false, features = [
+    "std",
+    "medium-ip",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-tcp",
+    "socket-udp",
+    "socket-icmp",
+    "async",
+    "multicast",
+] }
+
+# TUN device creation + async I/O (tokio backend).
+tun = { version = "0.8", features = ["async"] }
+
+# Async runtime. The netstack actor, the TUN reader/writer and every per-connection
+# relay run as tokio tasks. `rt-multi-thread` + `macros` for #[tokio::main].
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "time", "fs"] }
+
+# Async trait support (Proxy::connect_async, etc.).
+async-trait = "0.1"
+
+# Zero-copy buffer pooling for the relay, mirroring tun2socks' buffer package.
+bytes = "1"
+
+# CLI flag parsing, mirroring the pflag-based main.go.
+clap = { version = "4", features = ["derive"] }
+
+# Structured logging (replaces zap).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Error ergonomics.
+anyhow = "1"
+thiserror = "2"
