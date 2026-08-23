@@ -9,7 +9,7 @@ license = "Apache-2.0"
 # Userspace TCP/IP stack. We use the std + async feature set: IPv4/IPv6, TCP/UDP
 # sockets, and the async waker API so each virtual connection can present an
 # AsyncRead/AsyncWrite surface without blocking the single poll loop.
-smoltcp = { version = "0.14", default-features = false, features = [
+smoltcp = { path = "../smoltcp", default-features = false, features = [
     "std",
     "medium-ip",
     "proto-ipv4",
@@ -17,7 +17,6 @@ smoltcp = { version = "0.14", default-features = false, features = [
     "socket-tcp",
     "socket-udp",
     "socket-icmp",
-    "socket-raw",
     "async",
     "multicast",
 ] }

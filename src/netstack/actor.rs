@@ -13,45 +13,30 @@
 //! * each [`VConn`] ships its read/write/close as commands back into the actor,
 //!   which services them right after the next `poll`.
 //!
-//! ## The accept model — per-destination SYN interception
+//! ## The accept model — wildcard-port listening
 //!
 //! gVisor's `tcp.NewForwarder` accepts a SYN directed at *any* destination and
 //! hands you a fully-formed connection. A real TUN carries connections to
 //! arbitrary `(ip, port)` pairs, so tun2socks needs exactly that.
 //!
-//! smoltcp has no forwarder API, and a TCP socket can only `listen` on a single
-//! concrete port (there is no port wildcard — a listener matches exactly one
-//! `dst_port`, though the address may be wildcard). Worse, when no TCP socket
-//! `accepts` an inbound segment, `Interface` emits a TCP RST — which would kill
-//! every connection to a port we hadn't pre-opened.
+//! smoltcp (with the `allow-listen-any-port` addition) lets a TCP socket
+//! `listen` on [`IpListenPort::Any`], matching an inbound SYN regardless of
+//! its destination port. The local endpoint reported after `accept` then
+//! carries the `(dst_ip, dst_port)` the SYN actually targeted — which is the
+//! original-destination the relay hands to SOCKS5. No port has to be known in
+//! advance, and no SYN is ever RST'd for lacking a listener.
 //!
-//! The solution uses smoltcp's own escape hatch: a `raw` socket bound to all
-//! protocols runs in `Interface`'s dispatch path *before* TCP. smoltcp enqueues
-//! a copy of every IP packet into the raw socket's rx ring and sets
-//! `handled_by_raw_socket = true`, which **suppresses the RST** that would
-//! otherwise fire when no TCP listener matches. So every stray SYN is observed
-//! without being RST'd, giving us a chance to react.
-//!
-//! Each poll, the actor drains the raw ring, parses each packet for a pure SYN,
-//! reads its `(dst_ip, dst_port)`, and — the first time it sees a given port —
-//! lazily `listen`s a pool of TCP sockets on that port, then **re-injects** the
-//! SYN into `Phy::inbound_buf` so the *next* poll feeds it to the now-existing
-//! listener (no client retransmit wait). Data/ACK packets on established
-//! connections also hit the raw ring; they are drained and dropped (only the
-//! first SYN per port is re-injected, which is what breaks the re-inject loop).
+//! A single listener accepts exactly one connection before leaving LISTEN, so
+//! the actor keeps a small pool of wildcard listeners warm and replenishes it
+//! as connections arrive (bounded headroom for bursty concurrent connects).
 
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::time::Duration;
 
 use smoltcp::iface::{Interface, SocketHandle, SocketSet};
-use smoltcp::socket::raw::{
-    PacketBuffer as RawPacketBuffer, PacketMetadata as RawPacketMetadata,
-    RecvError as RawRecvError, Socket as RawSocket,
-};
 use smoltcp::socket::tcp::{RecvError, SendError, Socket as TcpSocket, State};
 use smoltcp::time::Instant;
-use smoltcp::wire::{IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket};
+use smoltcp::wire::IpListenPort;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
@@ -66,25 +51,19 @@ use super::vconn::{ConnCmd, ConnMeta, VConn, VConnError};
 /// sizes; we pick a conservative default and let config drive it later.
 const TCP_RX_BUF: usize = 64 * 1024;
 const TCP_TX_BUF: usize = 64 * 1024;
-/// How many listening sockets to keep warm per observed destination port. Each
-/// one can accept exactly one connection before it stops listening, so the pool
-/// must be replenished as connections arrive. A small per-port pool absorbs
-/// bursty concurrent connects to one port while bounding socket count.
+/// How many wildcard-port listening sockets to keep warm. Each one accepts
+/// exactly one connection before it stops listening, so the pool is
+/// replenished as connections arrive. A small pool absorbs bursty concurrent
+/// connects while bounding socket count.
 const LISTENERS_PER_PORT: usize = 4;
-/// Capacity of the raw socket's receive ring. The actor drains it every poll
-/// (≤ `IDLE_POLL_INTERVAL`), so this only needs to absorb a burst between
-/// polls; when full, smoltcp silently drops new raw copies (the matching TCP
-/// listener still processes the original packet normally).
-const RAW_RX_DEPTH: usize = 64;
-/// Payload budget for the raw rx ring. Packets larger than this are recorded as
-/// `RecvError::Truncated` on drain and skipped (the e2e data path does not rely
-/// on the raw copy for large payloads — only SYNs, which are tiny).
-const RAW_RX_PAYLOAD: usize = 64 * 1024;
-/// Sentinel listen port meaning "no pre-warmed listener; create them lazily on
-/// the first SYN to each port" (production).
-pub const LAZY_LISTEN: u16 = 0;
 /// Historical default listen port; kept for tests that drive the old fixed-port
 /// model via [`NetstackActor::with_listen_port`]/[`NetstackActor::new`].
+/// Production uses wildcard-port listening (see [`NetstackActor::spawn`]).
+/// Sentinel passed to [`NetstackActor::spawn`] meaning "use wildcard-port
+/// listeners" (production): sockets `listen` on [`IpListenPort::Any`] and
+/// accept a SYN to any `(ip, port)` without pre-warming. Any other value keeps
+/// the legacy fixed-port model for tests.
+pub const LAZY_LISTEN: u16 = 0;
 pub const DEFAULT_LISTEN_PORT: u16 = 1080;
 
 /// Handle held by the runtime to interact with the actor.
@@ -126,16 +105,15 @@ pub struct NetstackActor {
     /// `VConn::read`/`write` block as the relay expects, instead of
     /// spuriously truncating the stream.
     conns: HashMap<SocketHandle, ConnState>,
-    /// Idle listening sockets, grouped by the destination port each listens on.
-    /// Each socket accepts exactly one connection before leaving the LISTEN
-    /// state, so its pool is replenished as connections arrive. Entries are
-    /// created lazily by [`drain_raw_and_ensure_listeners`] the first time a
-    /// SYN for that port is observed (production); test construction may
-    /// pre-warm a single port via `prelisten`.
-    listeners: ListenerPools,
-    /// The all-protocol raw socket used as the SYN tap (see the module docs).
-    /// Its rx ring is drained each poll in [`drain_raw_and_ensure_listeners`].
-    raw_socket: SocketHandle,
+    /// Idle wildcard-port listening sockets. Each accepts exactly one
+    /// connection (to any `(ip, port)` — see the module docs) before leaving
+    /// the LISTEN state, so they are classified and replenished back to
+    /// [`LISTENERS_PER_PORT`] each poll in [`try_accept`].
+    listeners: Vec<SocketHandle>,
+    /// `None` (production): `listeners` are wildcard-port sockets. `Some(p)`
+    /// (tests): they listen on the fixed port `p`. Recorded so [`try_accept`]
+    /// replenishes the pool with the right kind after recycling a slot.
+    prelisten: Option<u16>,
     /// Where accepted connections are delivered.
     accepted_tx: mpsc::Sender<(VConn, ConnMeta)>,
     stop: mpsc::Receiver<()>,
@@ -193,10 +171,10 @@ impl NetstackActor {
     /// relay dispatcher's `recv()` to return `None` and exit. So a single stop
     /// signal cleanly tears down both tasks.
     ///
-    /// `prelisten`, when `Some(p)`, pre-warms a listener pool on port `p`
-    /// (used by the test constructors to keep the old fixed-port shape). `None`
-    /// means production: every listener is created lazily on the first SYN to
-    /// its port.
+    /// `prelisten`, when `Some(p)`, pre-warms a fixed-port listener pool on port
+    /// `p` (used by the test constructors to keep the old fixed-port shape).
+    /// `None` means production: a wildcard-port pool (`listen` on
+    /// [`IpListenPort::Any`]) that accepts a SYN to any `(ip, port)`.
     fn with_channels(
         iface: Interface,
         phy: Phy,
@@ -206,11 +184,22 @@ impl NetstackActor {
     ) -> Self {
         let mut sockets = SocketSet::new(vec![]);
 
-        let raw_socket = add_raw_socket(&mut sockets);
-
-        let mut listeners = ListenerPools::default();
-        if let Some(port) = prelisten {
-            listeners.ensure_pool(&mut sockets, port);
+        // Production (prelisten == None) listens on a wildcard port: a small
+        // pool of sockets each `listen` on `IpListenPort::Any`, so a SYN to any
+        // (ip, port) finds a taker. Tests pass `Some(port)` to keep the old
+        // fixed-port model on a collision-free ephemeral port.
+        let mut listeners: Vec<SocketHandle> = Vec::new();
+        match prelisten {
+            None => {
+                for _ in 0..LISTENERS_PER_PORT {
+                    listeners.push(add_wildcard_listener(&mut sockets));
+                }
+            }
+            Some(port) => {
+                for _ in 0..LISTENERS_PER_PORT {
+                    listeners.push(add_fixed_listener(&mut sockets, port));
+                }
+            }
         }
 
         Self {
@@ -219,7 +208,7 @@ impl NetstackActor {
             sockets,
             conns: HashMap::new(),
             listeners,
-            raw_socket,
+            prelisten,
             accepted_tx,
             stop: stop_rx,
         }
@@ -285,25 +274,58 @@ impl NetstackActor {
         }
     }
 
-    /// Walk the listener pools and lift completed handshakes.
+    /// Walk the wildcard listener pool and lift completed handshakes.
     ///
-    /// This runs *before* `iface.poll` in the run loop. It first drains the raw
-    /// socket's rx ring: every observed SYN whose `dst_port` has no listener yet
-    /// triggers a freshly-listened pool for that port and a re-injection of the
-    /// SYN so the following `poll` feeds it to the now-existing listener. Then
-    /// it classifies each listening socket by state — ESTABLISHED sockets have
-    /// accepted a connection and are handed to the relay dispatcher;
-    /// closing/closed sockets are recycled with a fresh listener.
+    /// This runs *before* `iface.poll` in the run loop. It classifies each
+    /// listening socket by state — ESTABLISHED sockets have accepted a
+    /// connection (covering any `(ip, port)`, since they `listen`ed on
+    /// [`IpListenPort::Any`]) and are handed to the relay dispatcher;
+    /// closing/closed sockets are recycled with a fresh wildcard listener, and
+    /// the pool is replenished back to [`LISTENERS_PER_PORT`]. No SYN is ever
+    /// RST'd for lacking a matching listener, so there is no packet tap or
+    /// re-injection here — smoltcp dispatches each SYN straight to a wildcard
+    /// listener during `poll`.
     ///
     /// This is the smoltcp equivalent of gVisor's `tcp.ForwarderRequest` →
     /// `CreateEndpoint` → `h.HandleTCP(conn)` chain in `core/tcp.go`.
     fn try_accept(&mut self) {
-        // 1. Drain the raw SYN tap: lazily create listeners and re-inject SYNs.
-        self.drain_raw_and_ensure_listeners();
-
-        // 2. Classify each listening socket by state and replenish the pools —
-        //    owned by `ListenerPools`.
-        let accepted = self.listeners.classify_and_replenish(&mut self.sockets);
+        // Classify each listening socket by state. Established → accept;
+        // closing/closed → recycle; still-listening → keep. Replenish the pool
+        // back to LISTENERS_PER_PORT afterwards. Work over a fresh Vec so the
+        // &mut self.sockets borrow ends before we touch self.conns below.
+        let mut accepted: Vec<(
+            SocketHandle,
+            Option<smoltcp::wire::IpEndpoint>,
+            Option<smoltcp::wire::IpEndpoint>,
+        )> = Vec::new();
+        let mut keep: Vec<SocketHandle> = Vec::with_capacity(self.listeners.len());
+        for handle in self.listeners.drain(..) {
+            let s = self.sockets.get_mut::<TcpSocket>(handle);
+            match s.state() {
+                State::Listen | State::SynReceived | State::SynSent => keep.push(handle),
+                State::Established => {
+                    let local = s.local_endpoint();
+                    let remote = s.remote_endpoint();
+                    debug!(?local, ?remote, "[NETSTACK] accepted tcp");
+                    accepted.push((handle, local, remote));
+                }
+                _ => {
+                    s.abort();
+                    let _ = self.sockets.remove(handle);
+                }
+            }
+        }
+        // Replenish back to LISTENERS_PER_PORT with fresh wildcard listeners
+        // (absorbs both recycled slots and the steady-state top-up).
+        let is_wildcard = self.prelisten.is_none();
+        for _ in keep.len()..LISTENERS_PER_PORT {
+            keep.push(if is_wildcard {
+                add_wildcard_listener(&mut self.sockets)
+            } else {
+                add_fixed_listener(&mut self.sockets, self.prelisten.unwrap())
+            });
+        }
+        self.listeners = keep;
 
         for (handle, local, remote) in accepted {
             let Some(dst) = local.and_then(to_socket_addr) else {
@@ -338,69 +360,6 @@ impl NetstackActor {
                 let _ = self.sockets.remove(handle);
                 continue;
             }
-        }
-    }
-
-    /// Drain the raw socket's rx ring and lazily create listeners for any
-    /// destination port we see a pure SYN for.
-    ///
-    /// `raw_socket` queues a copy of *every* IP packet (SYN, data, ACK, …);
-    /// smoltcp also sets `handled_by_raw_socket = true`, which suppresses the
-    /// RST for unmatched SYNs. We only act on pure SYNs (`syn() && !ack()`):
-    ///
-    /// * first SYN for a `dst_port` we have no listener for → create a
-    ///   `LISTENERS_PER_PORT` pool on that port, then `phy.reinject(syn)` so
-    ///   the next `poll` feeds the SYN to the now-existing listener (no client
-    ///   retransmit wait);
-    /// * SYN for a port we already serve → drop the copy; the listener (or a
-    ///   sibling in the pool) handles the original via `process_tcp`.
-    ///
-    /// Non-SYN packets are drained and dropped (harmless observation overhead).
-    fn drain_raw_and_ensure_listeners(&mut self) {
-        // Work on a local list of (port-to-create, syn-to-reinject) so the
-        // borrows of `self.sockets` (raw recv + add_listener) and `self.phy`
-        // (reinject) don't alias across the loop.
-        let mut ensure: Vec<u16> = Vec::new();
-        let mut reinject: Option<Vec<u8>> = None;
-
-        loop {
-            let mut buf = vec![0u8; RAW_RX_PAYLOAD];
-            let n = {
-                let raw = self.sockets.get_mut::<RawSocket>(self.raw_socket);
-                match raw.recv_slice(&mut buf) {
-                    Ok(n) => n,
-                    Err(RawRecvError::Exhausted) => break,
-                    Err(RawRecvError::Truncated) => continue, // larger than our buffer; skip
-                }
-            };
-            buf.truncate(n);
-            let Some((src, _sport, dst, dport)) = parse_tcp_syn(&buf) else {
-                continue; // not a pure SYN; drop the raw copy.
-            };
-            if self.listeners.has_port(dport) {
-                continue; // already served; the TCP listener handles the original.
-            }
-            // New destination port: create a pool and re-inject this SYN.
-            if !ensure.contains(&dport) {
-                ensure.push(dport);
-            }
-            // Re-inject only the first SYN that triggered creation for this
-            // port (subsequent first-SYNs in the same drain loop are redundant;
-            // the re-injected one plus the listener is enough to start the
-            // handshake, and any others will be RST-suppressed until the
-            // listener is up, then accepted).
-            if reinject.is_none() {
-                reinject = Some(buf.clone());
-            }
-            debug!(%src, %dst, port = dport, "[NETSTACK] first SYN for port, creating listener");
-            let _ = (src, dst);
-        }
-
-        for port in ensure {
-            self.listeners.ensure_pool(&mut self.sockets, port);
-        }
-        if let Some(pkt) = reinject {
-            self.phy.reinject(pkt);
         }
     }
 
@@ -650,9 +609,9 @@ impl NetstackActor {
     /// driven out of the dispatcher task spawned here).
     ///
     /// `listen_port`: pass [`LAZY_LISTEN`] (0) for production — listeners are
-    /// created lazily on the first SYN to each observed destination port (the
-    /// gVisor `NewForwarder` equivalent). A non-zero value pre-warms the legacy
-    /// fixed-port listener pool on that port (used by tests).
+    /// wildcard-port sockets (`listen` on [`IpListenPort::Any`]) that accept a
+    /// SYN to any `(ip, port)`, the gVisor `NewForwarder` equivalent. A non-zero
+    /// value pre-warms the legacy fixed-port listener pool on that port (tests).
     pub fn spawn(
         iface: Interface,
         phy: Phy,
@@ -693,174 +652,33 @@ impl NetstackActor {
 
 // ---- helpers ---------------------------------------------------------------
 
-/// Create a fresh listening socket on `listen_port` and add it to the set.
-fn add_listener(sockets: &mut SocketSet<'static>, listen_port: u16) -> SocketHandle {
+/// Create a fresh wildcard-port listening socket and add it to the set.
+///
+/// `listen` on `IpListenPort::Any` (with a wildcard address) matches an inbound
+/// SYN regardless of its destination `(ip, port)` — the gVisor
+/// `NewForwarder` equivalent. The local endpoint reported after `accept`
+/// carries the SYN's real destination, which the relay hands to SOCKS5 as the
+/// original destination. No port has to be known in advance, and no SYN is
+/// ever RST'd for lacking a matching listener.
+fn add_wildcard_listener(sockets: &mut SocketSet<'static>) -> SocketHandle {
+    use smoltcp::wire::IpListenEndpoint;
     let mut s = super::new_tcp_socket(TCP_RX_BUF, TCP_TX_BUF);
-    // Listen on a wildcard address: smoltcp's `listen(port)` (the `From<u16>`
-    // for `ListenEndpoint`) sets `addr = None`, which matches SYNs to *any*
-    // destination IP. That is the closest the fixed-port model gets to gVisor's
-    // NewForwarder behaviour — it still constrains connections to a single port
-    // (the per-destination `TODO(smoltcp)` above lifts that too), but at least
-    // any source/destination IP pair is accepted.
-    let _ = s.listen(listen_port);
+    let _ = s.listen(IpListenEndpoint {
+        addr: None,
+        port: IpListenPort::Any,
+    });
     sockets.add(s)
 }
 
-/// Idle listening sockets, grouped by the destination port each listens on.
-/// Encapsulates the per-port pool logic so the actor body stays flat: the
-/// `HashMap<u16, Vec<SocketHandle>>` plus the "replenish to LISTENERS_PER_PORT"
-/// and "classify by TCP state" operations live here. Each socket accepts
-/// exactly one connection before leaving LISTEN, so its pool self-heals via
-/// [`classify_and_replenish`].
-#[derive(Default)]
-struct ListenerPools {
-    pools: HashMap<u16, Vec<SocketHandle>>,
-}
-
-impl ListenerPools {
-    /// Whether a listener pool exists for `port`.
-    fn has_port(&self, port: u16) -> bool {
-        self.pools.contains_key(&port)
-    }
-
-    /// Ensure a full `LISTENERS_PER_PORT` pool exists on `port` (creating and
-    /// replenishing as needed). Called the first time a SYN for `port` is
-    /// observed, and by the test pre-warm path.
-    fn ensure_pool(&mut self, sockets: &mut SocketSet<'static>, port: u16) {
-        let pool = self.pools.entry(port).or_default();
-        for _ in pool.len()..LISTENERS_PER_PORT {
-            pool.push(add_listener(sockets, port));
-        }
-    }
-
-    /// Walk every listening socket, lifting `Established` ones into the
-    /// returned list (with their local/remote endpoints), recycling
-    /// closing/closed ones, keeping the still-listening, and replenishing each
-    /// pool back to `LISTENERS_PER_PORT`. One pass, mutating `sockets`.
-    fn classify_and_replenish(
-        &mut self,
-        sockets: &mut SocketSet<'static>,
-    ) -> Vec<(
-        SocketHandle,
-        Option<smoltcp::wire::IpEndpoint>,
-        Option<smoltcp::wire::IpEndpoint>,
-    )> {
-        let mut accepted: Vec<(
-            SocketHandle,
-            Option<smoltcp::wire::IpEndpoint>,
-            Option<smoltcp::wire::IpEndpoint>,
-        )> = Vec::new();
-
-        for (_port, pool) in self.pools.iter_mut() {
-            let mut keep = Vec::with_capacity(pool.len());
-            for handle in pool.drain(..) {
-                let s = sockets.get_mut::<TcpSocket>(handle);
-                match s.state() {
-                    State::Listen | State::SynReceived | State::SynSent => keep.push(handle),
-                    State::Established => {
-                        // Connection accepted. Read the endpoints (the metadata
-                        // tun2socks attaches as `TransportEndpointID`).
-                        let local = s.local_endpoint();
-                        let remote = s.remote_endpoint();
-                        debug!(?local, ?remote, "[NETSTACK] accepted tcp");
-                        accepted.push((handle, local, remote));
-                    }
-                    _ => {
-                        // Closing/closed — drop the slot; the top-up pass below
-                        // replenishes the pool with a fresh listener.
-                        s.abort();
-                        let _ = sockets.remove(handle);
-                    }
-                }
-            }
-            *pool = keep;
-        }
-
-        // Replenish every pool back to LISTENERS_PER_PORT (absorbs both recycled
-        // slots and the first-connect case where a pool was just created empty).
-        let mut to_top_up: Vec<u16> = Vec::new();
-        for (&port, pool) in self.pools.iter() {
-            for _ in pool.len()..LISTENERS_PER_PORT {
-                to_top_up.push(port);
-            }
-        }
-        for port in to_top_up {
-            self.pools
-                .entry(port)
-                .or_default()
-                .push(add_listener(sockets, port));
-        }
-
-        accepted
-    }
-}
-
-/// Create the all-protocol raw socket used as the SYN tap (see the module
-/// docs) and add it to the set. `None, None` matches every IP version and
-/// protocol, so smoltcp enqueues a copy of every inbound packet into its rx
-/// ring and sets `handled_by_raw_socket = true` (suppressing the RST that
-/// would otherwise fire for SYNs with no matching TCP listener).
-fn add_raw_socket(sockets: &mut SocketSet<'static>) -> SocketHandle {
-    let rx = RawPacketBuffer::new(
-        vec![RawPacketMetadata::EMPTY; RAW_RX_DEPTH],
-        vec![0u8; RAW_RX_PAYLOAD],
-    );
-    // The raw socket never sends (we only tap inbound); an empty tx ring
-    // satisfies the constructor.
-    let tx = RawPacketBuffer::new(Vec::new(), Vec::new());
-    let raw = RawSocket::new(None, None, rx, tx);
-    sockets.add(raw)
-}
-
-/// Inspect a raw IP packet and, if it is a pure TCP SYN, return its
-/// `(src_ip, src_port, dst_ip, dst_port)` 4-tuple. Returns `None` for anything
-/// else (non-SYN, non-TCP, malformed) so the caller can drop the raw copy.
-///
-/// Uses the low-level wire packet getters directly (flag bits + port fields)
-/// rather than the full `TcpRepr::parse`, avoiding a redundant checksum verify
-/// — smoltcp already accepted the packet into the raw ring. The version is read
-/// from the first nibble, mirroring the `tun` crate's own `is_ipv6`.
-fn parse_tcp_syn(pkt: &[u8]) -> Option<(IpAddr, u16, IpAddr, u16)> {
-    if pkt.is_empty() {
-        return None;
-    }
-    match pkt[0] >> 4 {
-        4 => {
-            let ip = Ipv4Packet::new_checked(pkt).ok()?;
-            if ip.next_header() != IpProtocol::Tcp {
-                return None;
-            }
-            let payload = ip.payload();
-            let tcp = TcpPacket::new_checked(payload).ok()?;
-            if !tcp.syn() || tcp.ack() {
-                return None;
-            }
-            Some((
-                IpAddr::V4(ip.src_addr()),
-                tcp.src_port(),
-                IpAddr::V4(ip.dst_addr()),
-                tcp.dst_port(),
-            ))
-        }
-        6 => {
-            let ip = Ipv6Packet::new_checked(pkt).ok()?;
-            if ip.next_header() != IpProtocol::Tcp {
-                return None;
-            }
-            let payload = ip.payload();
-            let tcp = TcpPacket::new_checked(payload).ok()?;
-            if !tcp.syn() || tcp.ack() {
-                return None;
-            }
-            Some((
-                IpAddr::V6(ip.src_addr()),
-                tcp.src_port(),
-                IpAddr::V6(ip.dst_addr()),
-                tcp.dst_port(),
-            ))
-        }
-        _ => None,
-    }
+/// Create a fresh listening socket on a fixed `port` and add it to the set
+/// (the legacy single-port model, kept for tests that need a collision-free
+/// ephemeral port).
+fn add_fixed_listener(sockets: &mut SocketSet<'static>, listen_port: u16) -> SocketHandle {
+    let mut s = super::new_tcp_socket(TCP_RX_BUF, TCP_TX_BUF);
+    // `listen(port)` (the `From<u16>` for `ListenEndpoint`) sets `addr = None`,
+    // matching SYNs to *any* destination IP on this one port.
+    let _ = s.listen(listen_port);
+    sockets.add(s)
 }
 
 /// Convert an smoltcp `IpEndpoint` into a std `SocketAddr`.
@@ -885,153 +703,4 @@ fn to_socket_addr(ep: smoltcp::wire::IpEndpoint) -> Option<std::net::SocketAddr>
 /// the poll loop treats as "poll again immediately".
 fn smoltcp_duration_to_std(d: smoltcp::time::Duration) -> Duration {
     Duration::from_millis(d.millis())
-}
-
-/// A real command receiver is only available after `try_accept` creates one; to
-/// keep the `pending` map's value type uniform we use this thin wrapper.
-impl NetstackActor {
-    #[allow(dead_code)]
-    fn _state_used(_s: State) {}
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_tcp_syn;
-    use smoltcp::phy::ChecksumCapabilities;
-    use smoltcp::wire::{
-        IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
-    };
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-
-    /// Emit a raw IPv4 packet carrying `tcp` as payload, with correct checksums
-    /// (smoltcp verifies both in `new_checked`).
-    fn build_v4(src: Ipv4Addr, dst: Ipv4Addr, tcp: &TcpRepr) -> Vec<u8> {
-        let ip = Ipv4Repr {
-            src_addr: src,
-            dst_addr: dst,
-            next_header: IpProtocol::Tcp,
-            payload_len: tcp.buffer_len(),
-            hop_limit: 64,
-        };
-        let mut buf = vec![0u8; ip.buffer_len() + tcp.buffer_len()];
-        let caps = ChecksumCapabilities::default();
-        {
-            let mut p = Ipv4Packet::new_unchecked(&mut buf[..ip.buffer_len()]);
-            ip.emit(&mut p, &caps);
-        }
-        {
-            let mut p = TcpPacket::new_unchecked(&mut buf[ip.buffer_len()..]);
-            tcp.emit(&mut p, &IpAddress::Ipv4(src), &IpAddress::Ipv4(dst), &caps);
-        }
-        buf
-    }
-
-    #[test]
-    fn parse_tcp_syn_recognizes_a_pure_syn() {
-        let syn = TcpRepr {
-            src_port: 54321,
-            dst_port: 443,
-            control: TcpControl::Syn,
-            seq_number: TcpSeqNumber(100),
-            ack_number: None,
-            window_len: 65535,
-            window_scale: None,
-            max_seg_size: Some(1400),
-            sack_permitted: false,
-            sack_ranges: [None; 3],
-            timestamp: None,
-            payload: &[],
-        };
-        let pkt = build_v4(
-            Ipv4Addr::new(10, 0, 0, 2),
-            Ipv4Addr::new(172, 66, 0, 227),
-            &syn,
-        );
-        let (src, sport, dst, dport) = parse_tcp_syn(&pkt).expect("a pure SYN parses");
-        assert_eq!(src, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
-        assert_eq!(sport, 54321);
-        assert_eq!(dst, IpAddr::V4(Ipv4Addr::new(172, 66, 0, 227)));
-        assert_eq!(dport, 443);
-    }
-
-    #[test]
-    fn parse_tcp_syn_rejects_ack_and_data() {
-        // A pure ACK (control None, ack_number set) must not be treated as a SYN.
-        let ack = TcpRepr {
-            src_port: 54321,
-            dst_port: 443,
-            control: TcpControl::None,
-            seq_number: TcpSeqNumber(101),
-            ack_number: Some(TcpSeqNumber(1)),
-            window_len: 65535,
-            window_scale: None,
-            max_seg_size: None,
-            sack_permitted: false,
-            sack_ranges: [None; 3],
-            timestamp: None,
-            payload: &[],
-        };
-        let pkt = build_v4(
-            Ipv4Addr::new(10, 0, 0, 2),
-            Ipv4Addr::new(172, 66, 0, 227),
-            &ack,
-        );
-        assert!(parse_tcp_syn(&pkt).is_none(), "an ACK is not a pure SYN");
-
-        // A data segment (Psh + payload) is not a SYN either.
-        let data = TcpRepr {
-            control: TcpControl::Psh,
-            payload: b"hello",
-            ..ack
-        };
-        let pkt = build_v4(
-            Ipv4Addr::new(10, 0, 0, 2),
-            Ipv4Addr::new(172, 66, 0, 227),
-            &data,
-        );
-        assert!(
-            parse_tcp_syn(&pkt).is_none(),
-            "a data segment is not a pure SYN"
-        );
-
-        // A SYN-ACK (syn + ack) is rejected — only a pure connection-opening SYN
-        // is re-injected; a SYN-ACK here would be from an external peer we didn't
-        // initiate toward, not a flow to terminate.
-        let synack = TcpRepr {
-            control: TcpControl::Syn,
-            ack_number: Some(TcpSeqNumber(1)),
-            max_seg_size: Some(1400),
-            payload: &[],
-            ..ack
-        };
-        let pkt = build_v4(
-            Ipv4Addr::new(10, 0, 0, 2),
-            Ipv4Addr::new(172, 66, 0, 227),
-            &synack,
-        );
-        assert!(parse_tcp_syn(&pkt).is_none(), "a SYN-ACK is not a pure SYN");
-    }
-
-    #[test]
-    fn parse_tcp_syn_rejects_non_tcp_and_garbage() {
-        // An IPv4 packet carrying UDP must parse but be rejected by the protocol check.
-        let udp_ip = Ipv4Repr {
-            src_addr: Ipv4Addr::new(10, 0, 0, 2),
-            dst_addr: Ipv4Addr::new(172, 66, 0, 227),
-            next_header: IpProtocol::Udp,
-            payload_len: 8,
-            hop_limit: 64,
-        };
-        let mut buf = vec![0u8; udp_ip.buffer_len() + 8];
-        let caps = ChecksumCapabilities::default();
-        let mut p = Ipv4Packet::new_unchecked(&mut buf);
-        udp_ip.emit(&mut p, &caps);
-        assert!(parse_tcp_syn(&buf).is_none());
-
-        // Garbage / empty input.
-        assert!(parse_tcp_syn(&[]).is_none());
-        assert!(parse_tcp_syn(&[0u8; 20]).is_none());
-
-        let _ = Ipv6Addr::LOCALHOST; // keep the Ipv6 import live if v6 path is unused on this target
-    }
 }

@@ -15,8 +15,8 @@
 //!  * `tun_to_socks5_echo_e2e` — the actor is pre-warmed on the destination
 //!    port (the legacy fixed-port model).
 //!  * `lazy_syn_to_arbitrary_port_is_accepted` — the actor is started with
-//!    `LAZY_LISTEN` (no pre-warmed port) and must create a listener on demand
-//!    when it observes the SYN, proving the per-destination SYN interception.
+//!    `LAZY_LISTEN` (a wildcard-port listener pool) and accepts a SYN to an
+//!    arbitrary port it was never told about, proving the wildcard-listen path.
 //!
 //! The data path exercised end to end is:
 //!
@@ -333,14 +333,14 @@ async fn tun_to_socks5_echo_e2e() {
     assert_eq!(&got[..payload.len()], payload, "echo round-trip mismatch");
 }
 
-/// The actor is started with `LAZY_LISTEN` (no pre-warmed port) and must create
-/// a TCP listener on demand when it observes the first SYN for a destination
-/// port it has never seen — the per-destination SYN interception path.
+/// The actor is started with `LAZY_LISTEN` (a wildcard-port listener pool) and
+/// must accept a TCP SYN directed at a destination port it was never told about
+/// — the wildcard-listen path.
 ///
 /// The SYN is addressed to an arbitrary port (the echo target's ephemeral port)
 /// that the actor was never told about. Proving the SYN-ACK comes back with
-/// `src_port == dst_port` shows a listener was created lazily; the echo
-/// round-trip proves the lazily-accepted connection relays end to end.
+/// `src_port == dst_port` shows the wildcard listener matched it; the echo
+/// round-trip proves the accepted connection relays end to end.
 #[tokio::test(flavor = "current_thread")]
 async fn lazy_syn_to_arbitrary_port_is_accepted() {
     init_tracing();
@@ -375,7 +375,7 @@ async fn lazy_syn_to_arbitrary_port_is_accepted() {
     };
     let mut client = TcpClient::new(Ipv4Addr::new(10, 0, 0, 2), 54321, dst, dst_port);
 
-    // --- 3-way handshake (lazy path: two polls — drain + re-inject, then accept) ---
+    // --- 3-way handshake (wildcard listener accepts on the first poll) ---
     inbound.send(client.syn()).await.unwrap();
     sleep(Duration::from_millis(150)).await;
 

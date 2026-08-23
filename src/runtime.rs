@@ -53,9 +53,9 @@ impl Runtime {
         let iface = build_interface(&mut phy);
 
         // 4. Spawn the netstack actor + relay dispatcher. LAZY_LISTEN (0) means
-        //    no pre-warmed port: every TCP listener is created on demand when
-        //    the raw-socket SYN tap observes the first SYN for a destination
-        //    port — the gVisor NewForwarder equivalent.
+        //    a wildcard-port listener pool: sockets `listen` on `IpListenPort::Any`
+        //    and accept a SYN to any `(ip, port)` — the gVisor NewForwarder
+        //    equivalent, no port known in advance.
         let handle = NetstackActor::spawn(iface, phy, proxy.clone(), LAZY_LISTEN);
 
         // 5. Spawn the TUN pump: read packets from the fd → `inbound`, and write
