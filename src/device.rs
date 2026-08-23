@@ -91,7 +91,6 @@ impl phy::RxToken for RxToken {
 /// pushes it to the outbound channel for the TUN pump to write.
 pub struct TxToken<'a> {
     outbound: &'a mpsc::Sender<Packet>,
-    mtu: usize,
 }
 
 impl<'a> phy::TxToken for TxToken<'a> {
@@ -136,7 +135,6 @@ impl phy::Device for Phy {
             RxToken { buffer: pkt },
             TxToken {
                 outbound: &self.outbound_tx,
-                mtu: self.mtu,
             },
         ))
     }
@@ -144,7 +142,6 @@ impl phy::Device for Phy {
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
         Some(TxToken {
             outbound: &self.outbound_tx,
-            mtu: self.mtu,
         })
     }
 }

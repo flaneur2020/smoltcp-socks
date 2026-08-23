@@ -46,7 +46,12 @@ pub enum ConnCmd {
 pub enum VConnError {
     #[error("connection closed")]
     Closed,
+    /// Distinct from [`VConnError::Closed`] for a hard RST/abort. The current
+    /// actor maps smoltcp's `InvalidState` to `Closed`; a fuller impl that
+    /// inspects the TCP state would return `Reset` on an RST. Kept so the relay
+    /// can branch on it without an API change later.
     #[error("connection reset")]
+    #[allow(dead_code)]
     Reset,
     #[error("actor stopped")]
     ActorGone,

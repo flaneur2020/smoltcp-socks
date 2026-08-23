@@ -6,7 +6,14 @@
 use std::time::Duration;
 
 /// Runtime configuration, populated from CLI flags (see `main.rs`).
+///
+/// The field set mirrors tun2socks' `engine.Key` one-to-one. A few fields
+/// (`fwmark`, `interface`, `udp_timeout`, `log_level`) are parsed and stored but
+/// not yet consumed by a wired code path in the scaffold — they ride along so
+/// the struct stays a faithful translation of the Go config and is ready as
+/// those features land.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Config {
     /// TUN device to use, e.g. `tun://tun0`. Mirrors `engine.Key.Device`.
     pub device: String,

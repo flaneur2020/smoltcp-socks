@@ -22,8 +22,12 @@ impl<T> DynStream for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
 
 /// The upstream end of a proxied connection: a duplex byte stream plus the
 /// bound local address (for logging/statistics, as tun2socks records `MidIP`).
+///
+/// `local_addr` is populated by dialers but not yet surfaced by any statistics
+/// path in the scaffold; it is kept for parity with tun2socks' metadata.
 pub struct Upstream {
     pub stream: Box<dyn DynStream>,
+    #[allow(dead_code)]
     pub local_addr: SocketAddr,
 }
 
@@ -54,7 +58,11 @@ pub enum ProxyUrlError {
 }
 
 /// A parsed proxy URL, split into the bits a dialer needs.
+///
+/// `scheme` is retained for future dispatch (mirroring tun2socks' protocol
+/// registry) but only SOCKS5 is wired in the scaffold, so it is unread today.
 pub struct ProxyUrl {
+    #[allow(dead_code)]
     pub scheme: String,
     pub host: String,
     pub port: u16,
@@ -100,7 +108,13 @@ impl ProxyUrl {
             return Err(ProxyUrlError::MissingHost);
         }
 
-        Ok(Self { scheme, host, port, username, password })
+        Ok(Self {
+            scheme,
+            host,
+            port,
+            username,
+            password,
+        })
     }
 
     /// Build a concrete dialer from the parsed URL. This is the async analogue

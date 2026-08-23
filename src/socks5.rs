@@ -39,7 +39,12 @@ mod atyp {
 }
 
 /// RFC 1928 §5 bind-address, serialised for the request/reply.
+/// RFC 1928 §5 address. Requests here always carry a resolved IP (`Ip`); the
+/// `Domain` arm is kept for parity with the full SOCKS5 address space and the
+/// `write_request` match, but the scaffold never receives a domain destination
+/// (the TUN layer hands us concrete `SocketAddr`s).
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 enum BindAddr {
     Ip(IpAddr),
     Domain(&'static str), // scaffold: domains unsupported on the request side here

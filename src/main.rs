@@ -100,11 +100,14 @@ async fn main() -> Result<()> {
 
     let cfg = args.into_config();
     let rt = Runtime::start(&cfg)?;
-    let _ = rt;
 
     // Wait for Ctrl-C / SIGTERM — mirrors tun2socks' signal.Notify loop.
     tokio::signal::ctrl_c().await?;
     tracing::info!("[MAIN] received interrupt, shutting down");
+
+    // Cleanly tear down the actor + relay dispatcher — mirrors
+    // `engine.Stop()` closing the stack and waiting for it to drain.
+    rt.shutdown().await;
 
     Ok(())
 }

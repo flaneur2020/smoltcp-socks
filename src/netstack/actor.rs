@@ -122,9 +122,9 @@ impl NetstackActor {
         }
     }
 
-    /// Construct a standalone actor + handle pair (useful in tests and small
-    /// runtimes that drive accept themselves; the full runtime path goes
-    /// through `spawn`).
+    /// Construct a standalone actor + handle pair (used by tests; the full
+    /// runtime path goes through `spawn`, which is why this is otherwise dead).
+    #[allow(dead_code)]
     pub fn new(iface: Interface, phy: Phy) -> (Self, NetstackHandle) {
         let (accepted_tx, _accepted_rx) = mpsc::channel(64);
         let (stop_tx, stop_rx) = mpsc::channel(1);
