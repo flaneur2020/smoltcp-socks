@@ -108,28 +108,31 @@ pub struct NetstackActor {
     iface: Interface,
     phy: Phy,
     sockets: SocketSet<'static>,
-    /// Pending commands per connection, keyed by socket handle.
-    pending: HashMap<SocketHandle, mpsc::Receiver<ConnCmd>>,
-    /// Read/Write requests that could not be completed this cycle because the
-    /// smoltcp socket had nothing to dequeue (read) or no free tx space
-    /// (write). smoltcp's `recv_slice`/`send_slice` return `Ok(0)` when the
-    /// buffer is empty/full but the connection is still open — that is **not**
-    /// EOF, so we must not reply to the relay yet. Instead we stash the reply
-    /// here and retry it on subsequent [`service_commands`] cycles until the
-    /// socket delivers (or closes). This makes `VConn::read`/`write` block as
-    /// the relay expects, instead of spuriously truncating the stream.
+    /// Every accepted connection's routing state, keyed by socket handle.
     ///
-    /// At most one pending IO per connection (a relay naturally serializes its
-    /// read loop and its write loop), so this is a single optional slot, not a
-    /// queue.
-    pending_io: HashMap<SocketHandle, PendingIo>,
+    /// This unifies what used to be two maps: the command channel (`cmd_rx`)
+    /// and the at-most-one parked read/write request (`parked`). The relay
+    /// serializes its read loop and its write loop, so `parked` is a single
+    /// optional slot per connection, not a queue — enforced structurally by
+    /// the `Option` rather than as a cross-map invariant.
+    ///
+    /// `parked` holds Read/Write requests that could not be completed this
+    /// cycle because the smoltcp socket had nothing to dequeue (read) or no
+    /// free tx space (write). smoltcp's `recv_slice`/`send_slice` return
+    /// `Ok(0)` when the buffer is empty/full but the connection is still open
+    /// — that is **not** EOF, so we must not reply to the relay yet. Instead
+    /// we stash the reply here and retry it on subsequent [`service_commands`]
+    /// cycles until the socket delivers (or closes). This makes
+    /// `VConn::read`/`write` block as the relay expects, instead of
+    /// spuriously truncating the stream.
+    conns: HashMap<SocketHandle, ConnState>,
     /// Idle listening sockets, grouped by the destination port each listens on.
     /// Each socket accepts exactly one connection before leaving the LISTEN
     /// state, so its pool is replenished as connections arrive. Entries are
     /// created lazily by [`drain_raw_and_ensure_listeners`] the first time a
     /// SYN for that port is observed (production); test construction may
     /// pre-warm a single port via `prelisten`.
-    listeners: HashMap<u16, Vec<SocketHandle>>,
+    listeners: ListenerPools,
     /// The all-protocol raw socket used as the SYN tap (see the module docs).
     /// Its rx ring is drained each poll in [`drain_raw_and_ensure_listeners`].
     raw_socket: SocketHandle,
@@ -138,8 +141,19 @@ pub struct NetstackActor {
     stop: mpsc::Receiver<()>,
 }
 
+/// Routing state for one accepted virtual connection.
+///
+/// `cmd_rx` is the mailbox the relay sends commands into; `parked` is the
+/// at-most-one read/write request that couldn't complete this cycle (see
+/// [`NetstackActor::conns`]). Keeping them in one struct makes the "one parked
+/// IO per connection" invariant structural instead of a cross-map convention.
+struct ConnState {
+    cmd_rx: mpsc::Receiver<ConnCmd>,
+    parked: Option<PendingIo>,
+}
+
 /// A relay read/write request parked until the smoltcp socket can satisfy it
-/// (see [`NetstackActor::pending_io`]).
+/// (see [`ConnState::parked`]).
 enum PendingIo {
     /// Waiting for `recv_slice` to return >0 bytes (or the socket to close).
     Read {
@@ -194,23 +208,16 @@ impl NetstackActor {
 
         let raw_socket = add_raw_socket(&mut sockets);
 
-        let mut listeners: HashMap<u16, Vec<SocketHandle>> = HashMap::new();
+        let mut listeners = ListenerPools::default();
         if let Some(port) = prelisten {
-            listeners.insert(port, Vec::new());
-            for _ in 0..LISTENERS_PER_PORT {
-                listeners
-                    .get_mut(&port)
-                    .unwrap()
-                    .push(add_listener(&mut sockets, port));
-            }
+            listeners.ensure_pool(&mut sockets, port);
         }
 
         Self {
             iface,
             phy,
             sockets,
-            pending: HashMap::new(),
-            pending_io: HashMap::new(),
+            conns: HashMap::new(),
             listeners,
             raw_socket,
             accepted_tx,
@@ -294,50 +301,9 @@ impl NetstackActor {
         // 1. Drain the raw SYN tap: lazily create listeners and re-inject SYNs.
         self.drain_raw_and_ensure_listeners();
 
-        // 2. Classify each listening socket by state.
-        let mut accepted: Vec<(
-            SocketHandle,
-            Option<smoltcp::wire::IpEndpoint>,
-            Option<smoltcp::wire::IpEndpoint>,
-        )> = Vec::new();
-        for (_port, pool) in self.listeners.iter_mut() {
-            let mut keep = Vec::with_capacity(pool.len());
-            for handle in pool.drain(..) {
-                let s = self.sockets.get_mut::<TcpSocket>(handle);
-                match s.state() {
-                    State::Listen | State::SynReceived | State::SynSent => keep.push(handle),
-                    State::Established => {
-                        // Connection accepted. Read the endpoints (the metadata
-                        // tun2socks attaches as `TransportEndpointID`).
-                        let local = s.local_endpoint();
-                        let remote = s.remote_endpoint();
-                        debug!(?local, ?remote, "[NETSTACK] accepted tcp");
-                        accepted.push((handle, local, remote));
-                    }
-                    _ => {
-                        // Closing/closed — drop the slot; the top-up pass below
-                        // replenishes the pool with a fresh listener.
-                        s.abort();
-                        let _ = self.sockets.remove(handle);
-                    }
-                }
-            }
-            *pool = keep;
-        }
-        // Replenish every pool back to LISTENERS_PER_PORT (absorbs both recycled
-        // slots and the first-connect case where a pool was just created empty).
-        let mut to_top_up: Vec<u16> = Vec::new();
-        for (&port, pool) in self.listeners.iter() {
-            for _ in pool.len()..LISTENERS_PER_PORT {
-                to_top_up.push(port);
-            }
-        }
-        for port in to_top_up {
-            self.listeners
-                .entry(port)
-                .or_default()
-                .push(add_listener(&mut self.sockets, port));
-        }
+        // 2. Classify each listening socket by state and replenish the pools —
+        //    owned by `ListenerPools`.
+        let accepted = self.listeners.classify_and_replenish(&mut self.sockets);
 
         for (handle, local, remote) in accepted {
             let Some(dst) = local.and_then(to_socket_addr) else {
@@ -354,13 +320,19 @@ impl NetstackActor {
             // Keep the command receiver bound to this connection's socket. We
             // stash it before delivering the VConn so there is no window in
             // which a relay command arrives with no entry to drain it from.
-            self.pending.insert(handle, cmd_rx);
+            self.conns.insert(
+                handle,
+                ConnState {
+                    cmd_rx,
+                    parked: None,
+                },
+            );
 
             // Best-effort delivery: if the dispatcher is slow we drop the
             // connection rather than block the poll loop.
             if self.accepted_tx.try_send((vconn, meta)).is_err() {
                 warn!("[NETSTACK] accepted queue full, dropping connection");
-                self.pending.remove(&handle);
+                self.conns.remove(&handle);
                 let s = self.sockets.get_mut::<TcpSocket>(handle);
                 s.abort();
                 let _ = self.sockets.remove(handle);
@@ -405,7 +377,7 @@ impl NetstackActor {
             let Some((src, _sport, dst, dport)) = parse_tcp_syn(&buf) else {
                 continue; // not a pure SYN; drop the raw copy.
             };
-            if self.listeners.contains_key(&dport) {
+            if self.listeners.has_port(dport) {
                 continue; // already served; the TCP listener handles the original.
             }
             // New destination port: create a pool and re-inject this SYN.
@@ -425,19 +397,10 @@ impl NetstackActor {
         }
 
         for port in ensure {
-            self.ensure_listener_pool(port);
+            self.listeners.ensure_pool(&mut self.sockets, port);
         }
         if let Some(pkt) = reinject {
             self.phy.reinject(pkt);
-        }
-    }
-
-    /// Create a fresh `LISTENERS_PER_PORT` pool of listening sockets on `port`.
-    /// Called the first time a SYN for `port` is observed.
-    fn ensure_listener_pool(&mut self, port: u16) {
-        let pool = self.listeners.entry(port).or_default();
-        for _ in pool.len()..LISTENERS_PER_PORT {
-            pool.push(add_listener(&mut self.sockets, port));
         }
     }
 
@@ -445,9 +408,20 @@ impl NetstackActor {
     fn service_commands(&mut self) {
         // 1. Retry IO parked on a previous cycle (read-no-data / write-no-room).
         // `poll` has just delivered fresh bytes / freed tx space, so a parked
-        // request may now complete. Take the map out of `self` so the re-attempt
-        // (which borrows `self.sockets`) doesn't alias `self.pending_io`.
-        let parked = std::mem::take(&mut self.pending_io);
+        // request may now complete. We drive each parked IO through the same
+        // two-phase `do_read`/`do_write` as a fresh command: a socket-borrowing
+        // block computes an outcome, the borrow ends, then we either reply or
+        // re-park — so the `&mut self.sockets` and the `&mut self.conns` borrows
+        // never overlap.
+        //
+        // Collect the parked IO out of the map first so the retry pass can
+        // freely mutate `conns` (re-park / reply) without holding a borrow over
+        // the iteration.
+        let parked: Vec<(SocketHandle, PendingIo)> = self
+            .conns
+            .iter_mut()
+            .filter_map(|(h, st)| st.parked.take().map(|io| (*h, io)))
+            .collect();
         for (handle, io) in parked {
             self.attempt_parked(handle, io);
         }
@@ -455,14 +429,14 @@ impl NetstackActor {
         // 2. Collect handles whose command channel has closed so we can drop
         // them, and gather all newly-arrived commands. One pass so `apply_cmd`
         // (which mutably borrows `self.sockets`) does not alias the borrow of
-        // `self.pending` held by the iterator.
+        // `self.conns` held by the iterator.
         let mut dead = Vec::new();
         let mut queued: Vec<(SocketHandle, ConnCmd)> = Vec::new();
-        for (handle, rx) in self.pending.iter_mut() {
-            while let Ok(cmd) = rx.try_recv() {
+        for (handle, st) in self.conns.iter_mut() {
+            while let Ok(cmd) = st.cmd_rx.try_recv() {
                 queued.push((*handle, cmd));
             }
-            if rx.is_closed() && rx.is_empty() {
+            if st.cmd_rx.is_closed() && st.cmd_rx.is_empty() {
                 dead.push(*handle);
             }
         }
@@ -471,10 +445,11 @@ impl NetstackActor {
         }
         for h in dead {
             // Fail any still-parked IO for this connection before removing it.
-            if let Some(io) = self.pending_io.remove(&h) {
+            if let Some(st) = self.conns.remove(&h)
+                && let Some(io) = st.parked
+            {
                 io.fail(VConnError::Closed);
             }
-            self.pending.remove(&h);
             self.sockets.get_mut::<TcpSocket>(h).abort();
             let _ = self.sockets.remove(h);
             warn!(?h, "[NETSTACK] dropped idle virtual connection");
@@ -505,15 +480,18 @@ impl NetstackActor {
         // the other kind. A parked request of the *same* kind should never
         // happen (the relay awaits each reply before issuing the next); if it
         // somehow does, fail the old one rather than silently dropping a reply.
-        if let Some(existing) = self.pending_io.remove(&handle) {
-            match (&existing, &cmd) {
+        if let Some(st) = self.conns.get_mut(&handle)
+            && let Some(existing) = st.parked.take()
+        {
+            let same_kind = matches!(
+                (&existing, &cmd),
                 (PendingIo::Read { .. }, ConnCmd::Read { .. })
-                | (PendingIo::Write { .. }, ConnCmd::Write { .. }) => {
-                    existing.fail(VConnError::Closed);
-                }
-                _ => {
-                    self.pending_io.insert(handle, existing);
-                }
+                    | (PendingIo::Write { .. }, ConnCmd::Write { .. })
+            );
+            if same_kind {
+                existing.fail(VConnError::Closed);
+            } else {
+                st.parked = Some(existing);
             }
         }
 
@@ -525,7 +503,9 @@ impl NetstackActor {
                 let _ = reply.send(Ok(()));
             }
             ConnCmd::Close { reply } => {
-                if let Some(io) = self.pending_io.remove(&handle) {
+                if let Some(st) = self.conns.get_mut(&handle)
+                    && let Some(io) = st.parked.take()
+                {
                     io.fail(VConnError::Closed);
                 }
                 self.sockets.get_mut::<TcpSocket>(handle).abort();
@@ -535,38 +515,67 @@ impl NetstackActor {
     }
 
     /// Serve one read. Completes the `reply` immediately if data is available or
-    /// the socket is EOF/closed; otherwise parks it in `pending_io` to retry
-    /// next cycle. See [`PendingIo`] for why `Ok(0)` is not EOF.
+    /// the socket is EOF/closed; otherwise parks it in `conns[handle].parked`
+    /// to retry next cycle. See [`PendingIo`] for why `Ok(0)` is not EOF.
+    ///
+    /// Two-phase to dodge the borrow split: the socket borrow that computes the
+    /// outcome ends before we touch `self.conns` to park.
     fn do_read(
         &mut self,
         handle: SocketHandle,
         max_len: usize,
         reply: oneshot::Sender<Result<Vec<u8>, VConnError>>,
     ) {
-        let s = self.sockets.get_mut::<TcpSocket>(handle);
-        let mut buf = vec![0u8; max_len];
-        match s.recv_slice(&mut buf) {
-            Ok(0) => {
-                // No data buffered right now. If the socket can still receive,
-                // this is a "would block", not EOF — park and retry. If it can't
-                // (e.g. half-closed), `recv_slice` would have returned
-                // `Err(Finished)` instead, so reaching here means still-open.
-                if s.may_recv() {
-                    self.pending_io
-                        .insert(handle, PendingIo::Read { max_len, reply });
-                } else {
-                    let _ = reply.send(Ok(Vec::new()));
+        // Phase 1: borrow only `self.sockets`, produce an outcome.
+        enum ReadOutcome {
+            Data(Vec<u8>),
+            Park,
+            Eof,
+            Closed,
+        }
+        let outcome = {
+            let s = self.sockets.get_mut::<TcpSocket>(handle);
+            let mut buf = vec![0u8; max_len];
+            match s.recv_slice(&mut buf) {
+                Ok(0) => {
+                    // No data buffered right now. If the socket can still
+                    // receive, this is a "would block", not EOF — park and
+                    // retry. If it can't (e.g. half-closed), `recv_slice` would
+                    // have returned `Err(Finished)` instead, so reaching here
+                    // means still-open.
+                    if s.may_recv() {
+                        ReadOutcome::Park
+                    } else {
+                        ReadOutcome::Eof
+                    }
                 }
+                Ok(n) => {
+                    buf.truncate(n);
+                    ReadOutcome::Data(buf)
+                }
+                Err(RecvError::Finished) => ReadOutcome::Eof,
+                Err(RecvError::InvalidState) => ReadOutcome::Closed,
             }
-            Ok(n) => {
-                buf.truncate(n);
+        };
+        // Phase 2: socket borrow is over; reply or park into `self.conns`.
+        match outcome {
+            ReadOutcome::Data(buf) => {
                 let _ = reply.send(Ok(buf));
             }
-            Err(RecvError::Finished) => {
+            ReadOutcome::Eof => {
                 let _ = reply.send(Ok(Vec::new()));
             }
-            Err(RecvError::InvalidState) => {
+            ReadOutcome::Closed => {
                 let _ = reply.send(Err(VConnError::Closed));
+            }
+            ReadOutcome::Park => {
+                if let Some(st) = self.conns.get_mut(&handle) {
+                    st.parked = Some(PendingIo::Read { max_len, reply });
+                } else {
+                    // Connection was reaped between dispatch and now; the reply
+                    // must still complete so the relay doesn't hang.
+                    let _ = reply.send(Err(VConnError::Closed));
+                }
             }
         }
     }
@@ -574,6 +583,9 @@ impl NetstackActor {
     /// Serve one write of `data[offset..]`. Completes the `reply` with the count
     /// once at least one byte is enqueued (the relay retries the remainder), or
     /// parks it if the tx buffer is full but the socket is still sendable.
+    ///
+    /// Two-phase like [`do_read`]: the socket borrow that computes the write
+    /// result ends before we touch `self.conns` to park.
     fn do_write(
         &mut self,
         handle: SocketHandle,
@@ -581,25 +593,31 @@ impl NetstackActor {
         offset: usize,
         reply: oneshot::Sender<Result<usize, VConnError>>,
     ) {
-        let s = self.sockets.get_mut::<TcpSocket>(handle);
-        match s.send_slice(&data[offset..]) {
-            Ok(0) => {
-                // Tx buffer full. If we can still send, park and retry once
-                // `poll` drains it; otherwise the connection is closing.
-                if s.may_send() {
-                    self.pending_io.insert(
-                        handle,
-                        PendingIo::Write {
-                            data,
-                            offset,
-                            reply,
-                        },
-                    );
-                } else {
-                    let _ = reply.send(Err(VConnError::Closed));
+        // Phase 1: borrow only `self.sockets`, produce the outcome.
+        enum WriteOutcome {
+            Written(usize),
+            Park,
+            Closed,
+        }
+        let outcome = {
+            let s = self.sockets.get_mut::<TcpSocket>(handle);
+            match s.send_slice(&data[offset..]) {
+                Ok(0) => {
+                    // Tx buffer full. If we can still send, park and retry once
+                    // `poll` drains it; otherwise the connection is closing.
+                    if s.may_send() {
+                        WriteOutcome::Park
+                    } else {
+                        WriteOutcome::Closed
+                    }
                 }
+                Ok(n) => WriteOutcome::Written(n),
+                Err(SendError::InvalidState) => WriteOutcome::Closed,
             }
-            Ok(n) => {
+        };
+        // Phase 2: socket borrow is over; reply or park into `self.conns`.
+        match outcome {
+            WriteOutcome::Written(n) => {
                 // Reply with the number of freshly-accepted bytes. If only part
                 // of the tail was accepted, the relay will issue another Write
                 // for the remainder; we don't park-and-continue here because the
@@ -608,8 +626,19 @@ impl NetstackActor {
                 // contract. The single-cycle `Ok(n>0)` reply is enough.
                 let _ = reply.send(Ok(n));
             }
-            Err(SendError::InvalidState) => {
+            WriteOutcome::Closed => {
                 let _ = reply.send(Err(VConnError::Closed));
+            }
+            WriteOutcome::Park => {
+                if let Some(st) = self.conns.get_mut(&handle) {
+                    st.parked = Some(PendingIo::Write {
+                        data,
+                        offset,
+                        reply,
+                    });
+                } else {
+                    let _ = reply.send(Err(VConnError::Closed));
+                }
             }
         }
     }
@@ -675,6 +704,95 @@ fn add_listener(sockets: &mut SocketSet<'static>, listen_port: u16) -> SocketHan
     // any source/destination IP pair is accepted.
     let _ = s.listen(listen_port);
     sockets.add(s)
+}
+
+/// Idle listening sockets, grouped by the destination port each listens on.
+/// Encapsulates the per-port pool logic so the actor body stays flat: the
+/// `HashMap<u16, Vec<SocketHandle>>` plus the "replenish to LISTENERS_PER_PORT"
+/// and "classify by TCP state" operations live here. Each socket accepts
+/// exactly one connection before leaving LISTEN, so its pool self-heals via
+/// [`classify_and_replenish`].
+#[derive(Default)]
+struct ListenerPools {
+    pools: HashMap<u16, Vec<SocketHandle>>,
+}
+
+impl ListenerPools {
+    /// Whether a listener pool exists for `port`.
+    fn has_port(&self, port: u16) -> bool {
+        self.pools.contains_key(&port)
+    }
+
+    /// Ensure a full `LISTENERS_PER_PORT` pool exists on `port` (creating and
+    /// replenishing as needed). Called the first time a SYN for `port` is
+    /// observed, and by the test pre-warm path.
+    fn ensure_pool(&mut self, sockets: &mut SocketSet<'static>, port: u16) {
+        let pool = self.pools.entry(port).or_default();
+        for _ in pool.len()..LISTENERS_PER_PORT {
+            pool.push(add_listener(sockets, port));
+        }
+    }
+
+    /// Walk every listening socket, lifting `Established` ones into the
+    /// returned list (with their local/remote endpoints), recycling
+    /// closing/closed ones, keeping the still-listening, and replenishing each
+    /// pool back to `LISTENERS_PER_PORT`. One pass, mutating `sockets`.
+    fn classify_and_replenish(
+        &mut self,
+        sockets: &mut SocketSet<'static>,
+    ) -> Vec<(
+        SocketHandle,
+        Option<smoltcp::wire::IpEndpoint>,
+        Option<smoltcp::wire::IpEndpoint>,
+    )> {
+        let mut accepted: Vec<(
+            SocketHandle,
+            Option<smoltcp::wire::IpEndpoint>,
+            Option<smoltcp::wire::IpEndpoint>,
+        )> = Vec::new();
+
+        for (_port, pool) in self.pools.iter_mut() {
+            let mut keep = Vec::with_capacity(pool.len());
+            for handle in pool.drain(..) {
+                let s = sockets.get_mut::<TcpSocket>(handle);
+                match s.state() {
+                    State::Listen | State::SynReceived | State::SynSent => keep.push(handle),
+                    State::Established => {
+                        // Connection accepted. Read the endpoints (the metadata
+                        // tun2socks attaches as `TransportEndpointID`).
+                        let local = s.local_endpoint();
+                        let remote = s.remote_endpoint();
+                        debug!(?local, ?remote, "[NETSTACK] accepted tcp");
+                        accepted.push((handle, local, remote));
+                    }
+                    _ => {
+                        // Closing/closed — drop the slot; the top-up pass below
+                        // replenishes the pool with a fresh listener.
+                        s.abort();
+                        let _ = sockets.remove(handle);
+                    }
+                }
+            }
+            *pool = keep;
+        }
+
+        // Replenish every pool back to LISTENERS_PER_PORT (absorbs both recycled
+        // slots and the first-connect case where a pool was just created empty).
+        let mut to_top_up: Vec<u16> = Vec::new();
+        for (&port, pool) in self.pools.iter() {
+            for _ in pool.len()..LISTENERS_PER_PORT {
+                to_top_up.push(port);
+            }
+        }
+        for port in to_top_up {
+            self.pools
+                .entry(port)
+                .or_default()
+                .push(add_listener(sockets, port));
+        }
+
+        accepted
+    }
 }
 
 /// Create the all-protocol raw socket used as the SYN tap (see the module
