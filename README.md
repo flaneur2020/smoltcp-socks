@@ -14,8 +14,8 @@ This is a Rust reimplementation, scaffolded from the architecture of
            │  tun device  │ ──────────► │ Interface::poll        │
            │              │ ◄────────── │  (single owner task)   │
            └──────────────┘   packets   └───────────┬───────────┘
-                                                      │ accepted TCP conn
-                                                      ▼
+                                                    │ accepted TCP conn
+                                                    ▼
                                       ┌─────────────────────────────┐
                                       │ relay (bidirectional copy)  │
                                       └──────────────┬──────────────┘
