@@ -45,12 +45,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 anyhow = "1"
 thiserror = "2"
 
-# Integration tests live under tests/integrations/ (one level deeper than Cargo's
+# Integration tests live under integration/tests/ (one level deeper than Cargo's
 # default auto-discovery picks up), so declare each as an explicit test target.
 [[test]]
 name = "socks5_handshake"
-path = "tests/integrations/socks5_handshake.rs"
+path = "integration/tests/socks5_handshake.rs"
 
 [[test]]
 name = "tun_e2e"
-path = "tests/integrations/tun_e2e.rs"
+path = "integration/tests/tun_e2e.rs"
