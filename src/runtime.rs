@@ -17,6 +17,8 @@ use anyhow::{Context, Result, anyhow};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 
+use tun::AbstractDevice as _;
+
 use crate::config::Config;
 use crate::device::{DeviceHandles, Phy};
 use crate::netstack::{
@@ -74,24 +76,21 @@ impl Runtime {
 /// Background task bridging the async TUN fd and the sync smoltcp `phy`.
 ///
 /// Inbound: `tun.read() → inbound.send()`. Outbound: `outbound.recv() → tun.write()`.
-async fn tun_pump(device_spec: String, _mtu: usize, handles: DeviceHandles) {
+async fn tun_pump(device_spec: String, mtu: usize, handles: DeviceHandles) {
     let DeviceHandles {
         inbound,
         mut outbound,
     } = handles;
 
-    // Open the TUN device. The `tun` crate exposes an async device behind its
-    // `async` feature; this scaffold leaves the concrete create call as a
-    // clearly-marked TODO so the platform-specific bits (Linux tun vs macOS
-    // utun vs Windows wintun) can be filled in without disturbing the data flow.
-    let mut dev = match open_tun(&device_spec) {
+    // Open the TUN device (Linux tun / macOS utun) via the `tun` crate's async
+    // backend. `open_tun` logs the real (kernel-assigned) name on success.
+    let mut dev = match open_tun(&device_spec, mtu) {
         Ok(d) => d,
         Err(e) => {
             warn!("[TUN] failed to open {device_spec}: {e:#}; pump exiting");
             return;
         }
     };
-    info!("[TUN] device {} opened", device_spec);
 
     let mut buf = vec![0u8; 65535];
     loop {
@@ -125,18 +124,60 @@ async fn tun_pump(device_spec: String, _mtu: usize, handles: DeviceHandles) {
 /// Type alias for the async TUN device the `tun` crate gives us.
 type AsyncTun = tun::AsyncDevice;
 
-/// Open a TUN device from a `tun://name` spec.
+/// Parse the device spec into an optional TUN name.
 ///
-/// TODO(platform): fill in per-OS. On Linux `tun::Configuration` + `create_as_async`
-/// works directly; on macOS the fd is utun-style and needs the same `tun` crate's
-///Darwin backend. The signature matches what the pump expects.
-fn open_tun(spec: &str) -> Result<AsyncTun> {
+/// Accepts `tun://name`, `utun://name`, or a bare `name`. An empty name
+/// (after stripping the prefix) returns `None`, letting the kernel pick a
+/// free interface.
+///
+/// On Apple platforms the kernel only speaks utun: an explicit name must
+/// start with `utun` and carry a numeric suffix (e.g. `utun3`), otherwise
+/// we fail fast with a clear message instead of the crate's opaque
+/// `InvalidName`. On Linux any name passes straight through.
+fn parse_tun_name(spec: &str) -> Result<Option<String>> {
     let name = spec
         .strip_prefix("tun://")
         .or_else(|| spec.strip_prefix("utun://"))
         .unwrap_or(spec);
-    let mut cfg = tun::Configuration::default();
-    cfg.up().tun_name(name).mtu(1500);
+    if name.is_empty() {
+        return Ok(None);
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        if !name.starts_with("utun") || name[4..].parse::<u32>().is_err() {
+            return Err(anyhow!(
+                "macOS requires a utun name like `utun3` (got `{name}`); \
+                 pass `utun://` to let the kernel pick"
+            ));
+        }
+    }
+    Ok(Some(name.to_string()))
+}
 
-    tun::create_as_async(&cfg).map_err(|e| anyhow!("create tun: {e}"))
+/// Open a TUN device from a `tun://name` / `utun://name` / bare-name spec,
+/// wiring the resolved MTU and normalizing utun naming on Apple platforms.
+fn open_tun(spec: &str, mtu: usize) -> Result<AsyncTun> {
+    let name = parse_tun_name(spec)?;
+
+    let mut cfg = tun::Configuration::default();
+    cfg.up().mtu(mtu as u16);
+
+    // Apple: the `tun` crate's `PlatformConfig::default()` sets
+    // `packet_information = true` and `enable_routing = true`, which is exactly
+    // what utun needs — the 4-byte PI header is stripped on read and prepended
+    // on write, so smoltcp sees raw IP. Linux defaults to
+    // `packet_information = false` (IFF_TUN), also correct. No explicit
+    // platform_config overrides needed on either side.
+    if let Some(name) = name.as_deref() {
+        cfg.tun_name(name);
+    }
+
+    let dev = tun::create_as_async(&cfg).map_err(|e| anyhow!("create tun: {e}"))?;
+    // `AsyncDevice` derefs to the platform `Device`, so `AbstractDevice::tun_name`
+    // gives the real (possibly kernel-assigned) interface name.
+    info!(
+        "[TUN] opened {} (mtu {mtu})",
+        dev.tun_name().unwrap_or_else(|_| spec.into())
+    );
+    Ok(dev)
 }

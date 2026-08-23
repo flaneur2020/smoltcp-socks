@@ -47,8 +47,9 @@ Two gaps remain before this is production-ready (both are marked in the code wit
   `(ip, port)` pairs; matching those requires intercepting SYNs at the IP layer
   and creating a listener per destination, the way gVisor's `tcp.NewForwarder`
   does. This is the hardest porting task.
-- **Platform TUN setup.** The TUN open path is a thin placeholder; the per-OS
-  specifics (Linux `tun` vs. macOS `utun` vs. Windows `wintun`) still need wiring.
+- **Windows `wintun` backend.** The TUN open path handles Linux `tun` and macOS
+  `utun` (kernel-picked unit when no name is given, or an explicit `utunN`);
+  the Windows backend is not yet wired.
 
 ## Build
 
@@ -59,5 +60,8 @@ cargo build
 Running requires creating a TUN device (root/cap), e.g.:
 
 ```sh
-sudo target/debug/smoltcp-socks --device tun://tun0 --proxy socks5://127.0.0.1:1080 --mtu 1500
+# Linux (named tun0) / macOS (kernel picks a free utun)
+sudo target/debug/smoltcp-socks --device tun:// --proxy socks5://127.0.0.1:1080 --mtu 1500
+# macOS with an explicit utun unit
+sudo target/debug/smoltcp-socks --device utun://utun9 --proxy socks5://127.0.0.1:1080
 ```
