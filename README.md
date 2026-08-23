@@ -32,26 +32,23 @@ This is a Rust reimplementation, scaffolded from the architecture of
 4. The relay dials the SOCKS5 upstream, performs the client handshake, and copies
    bytes both ways until either side closes.
 
-## Architecture / module map
-
-| Rust module            | tun2socks (Go) counterpart          | Responsibility                                            |
-|------------------------|-------------------------------------|-----------------------------------------------------------|
-| `main.rs`              | `main.go`                           | CLI parsing, signal handling, start/stop.                |
-| `config.rs`            | `engine/key.go`                     | Configuration struct.                                      |
-| `runtime.rs`           | `engine/engine.go`                  | Wires device + netstack + proxy and drives the run loop.  |
-| `netstack/mod.rs`      | `core/stack.go`                     | smoltcp `Interface` setup (NIC, routes, promiscuous).      |
-| `netstack/actor.rs`    | `core/tcp.go` + `tunnel/tunnel.go`  | Single-owner poll loop; accepts virtual TCP connections.   |
-| `netstack/vconn.rs`    | `core/adapter/adapter.go`           | The virtual TCP connection exposed as AsyncRead/Write.     |
-| `device.rs`            | `core/device/*`                     | `smoltcp::phy::Device` impl over a `tun` fd.               |
-| `socks5.rs`            | `transport/socks5/socks5.go`         | SOCKS5 client handshake (greeting / auth / CONNECT).       |
-| `proxy.rs`             | `proxy/proxy.go` + `proxy/socks5/`  | `Proxy` trait + SOCKS5 dialer; target address parsing.     |
-| `relay.rs`             | `tunnel/tcp.go`                     | Bidirectional copy between virtual conn and upstream.      |
-
 ## Status
 
-This is a **scaffold**. The module boundaries, types, and data flow are laid out
-to mirror tun2socks, and every place that needs version-specific smoltcp wiring
-is marked with `// TODO(smoltcp)` / `todo!()` so it is easy to find and fill in.
+The data path works end to end and is covered by integration tests: a mocked TUN
+feeds the real netstack actor → relay → a real SOCKS5 server → a real echo target,
+and bytes round-trip correctly. CI runs `cargo fmt --check`, `cargo clippy -D
+warnings`, and `cargo test` on every PR.
+
+Two gaps remain before this is production-ready (both are marked in the code with
+`TODO`):
+
+- **Per-destination SYN interception.** The actor currently listens on a single
+  wildcard-address port. A real TUN carries TCP connections to arbitrary
+  `(ip, port)` pairs; matching those requires intercepting SYNs at the IP layer
+  and creating a listener per destination, the way gVisor's `tcp.NewForwarder`
+  does. This is the hardest porting task.
+- **Platform TUN setup.** The TUN open path is a thin placeholder; the per-OS
+  specifics (Linux `tun` vs. macOS `utun` vs. Windows `wintun`) still need wiring.
 
 ## Build
 
