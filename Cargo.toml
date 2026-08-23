@@ -50,3 +50,7 @@ thiserror = "2"
 [[test]]
 name = "socks5_handshake"
 path = "tests/integrations/socks5_handshake.rs"
+
+[[test]]
+name = "tun_e2e"
+path = "tests/integrations/tun_e2e.rs"

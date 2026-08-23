@@ -19,7 +19,9 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::device::{DeviceHandles, Phy};
-use crate::netstack::{NetstackActor, NetstackHandle, build_interface, resolve_mtu};
+use crate::netstack::{
+    DEFAULT_LISTEN_PORT, NetstackActor, NetstackHandle, build_interface, resolve_mtu,
+};
 use crate::proxy::{Proxy, ProxyUrl};
 
 /// The running program. `shutdown` stops everything cleanly.
@@ -51,7 +53,7 @@ impl Runtime {
         let iface = build_interface(&mut phy);
 
         // 4. Spawn the netstack actor + relay dispatcher.
-        let handle = NetstackActor::spawn(iface, phy, proxy.clone());
+        let handle = NetstackActor::spawn(iface, phy, proxy.clone(), DEFAULT_LISTEN_PORT);
 
         // 5. Spawn the TUN pump: read packets from the fd → `inbound`, and write
         //    `outbound` packets back to the fd. This is the async counterpart of

@@ -53,6 +53,11 @@ const TCP_TX_BUF: usize = 64 * 1024;
 /// one can accept exactly one connection before it stops listening, so the pool
 /// must be replenished as connections arrive.
 const LISTENER_POOL_SIZE: usize = 16;
+/// The port the listener pool accepts on in production. tun2socks maps the
+/// TUN's destination port straight through; the scaffold's fixed-port listener
+/// (see the `TODO(smoltcp)` note) therefore listens on the SOCKS5 port. Tests
+/// pass an ephemeral port instead via [`NetstackActor::with_listen_port`].
+pub const DEFAULT_LISTEN_PORT: u16 = 1080;
 
 /// Handle held by the runtime to interact with the actor.
 ///
@@ -83,6 +88,10 @@ pub struct NetstackActor {
     /// Where accepted connections are delivered.
     accepted_tx: mpsc::Sender<(VConn, ConnMeta)>,
     stop: mpsc::Receiver<()>,
+    /// Port the listener pool listens on. Production uses 1080 (the SOCKS5
+    /// port, matching tun2socks' default destination mapping); tests pass an
+    /// ephemeral port so they never collide with the host.
+    listen_port: u16,
 }
 
 impl NetstackActor {
@@ -97,6 +106,7 @@ impl NetstackActor {
         phy: Phy,
         accepted_tx: mpsc::Sender<(VConn, ConnMeta)>,
         stop_rx: mpsc::Receiver<()>,
+        listen_port: u16,
     ) -> Self {
         let mut sockets = SocketSet::new(vec![]);
 
@@ -108,7 +118,7 @@ impl NetstackActor {
         //   lazily creates a listener bound to each observed (dst_ip, dst_port).
         let mut listeners = Vec::new();
         for _ in 0..LISTENER_POOL_SIZE {
-            listeners.push(add_listener(&mut sockets));
+            listeners.push(add_listener(&mut sockets, listen_port));
         }
 
         Self {
@@ -119,16 +129,27 @@ impl NetstackActor {
             listeners,
             accepted_tx,
             stop: stop_rx,
+            listen_port,
         }
     }
 
-    /// Construct a standalone actor + handle pair (used by tests; the full
-    /// runtime path goes through `spawn`, which is why this is otherwise dead).
-    #[allow(dead_code)]
+    /// Construct a standalone actor + handle pair against the default listen
+    /// port. Used by tests that don't need the full `spawn` relay dispatcher.
+    #[cfg(test)]
     pub fn new(iface: Interface, phy: Phy) -> (Self, NetstackHandle) {
+        Self::with_listen_port(iface, phy, DEFAULT_LISTEN_PORT)
+    }
+
+    /// Construct a standalone actor + handle pair on a specific listen port.
+    /// Used by integration tests that need an ephemeral, collision-free port.
+    pub fn with_listen_port(
+        iface: Interface,
+        phy: Phy,
+        listen_port: u16,
+    ) -> (Self, NetstackHandle) {
         let (accepted_tx, _accepted_rx) = mpsc::channel(64);
         let (stop_tx, stop_rx) = mpsc::channel(1);
-        let actor = Self::with_channels(iface, phy, accepted_tx, stop_rx);
+        let actor = Self::with_channels(iface, phy, accepted_tx, stop_rx, listen_port);
         let handle = NetstackHandle { stop: stop_tx };
         (actor, handle)
     }
@@ -195,7 +216,7 @@ impl NetstackActor {
                     // Closing/closed — recycle the slot with a fresh listener.
                     s.abort();
                     let _ = self.sockets.remove(handle);
-                    still_listening.push(add_listener(&mut self.sockets));
+                    still_listening.push(add_listener(&mut self.sockets, self.listen_port));
                 }
             }
         }
@@ -261,11 +282,15 @@ impl NetstackActor {
     fn apply_cmd(&mut self, handle: SocketHandle, cmd: ConnCmd) {
         let s = self.sockets.get_mut::<TcpSocket>(handle);
         match cmd {
-            ConnCmd::Read { mut buf, reply } => {
+            ConnCmd::Read { max_len, reply } => {
+                let mut buf = vec![0u8; max_len];
                 let res = match s.recv_slice(&mut buf) {
-                    Ok(0) => Ok(0),
-                    Ok(n) => Ok(n),
-                    Err(RecvError::Finished) => Ok(0),
+                    Ok(0) => Ok(Vec::new()),
+                    Ok(n) => {
+                        buf.truncate(n);
+                        Ok(buf)
+                    }
+                    Err(RecvError::Finished) => Ok(Vec::new()),
                     Err(RecvError::InvalidState) => Err(VConnError::Closed),
                 };
                 let _ = reply.send(res);
@@ -290,19 +315,24 @@ impl NetstackActor {
 }
 
 impl NetstackActor {
-    /// Spawn the actor and its relay dispatcher together. Returns a handle the
-    /// runtime uses for shutdown only (the accepted-connection consumption is
-    /// driven out of the dispatcher task spawned here).
+    /// Spawn the actor and its relay dispatcher together, listening on
+    /// `listen_port`. Returns a handle the runtime uses for shutdown only (the
+    /// accepted-connection consumption is driven out of the dispatcher task
+    /// spawned here).
+    ///
+    /// Production callers pass [`DEFAULT_LISTEN_PORT`]; tests pass an ephemeral
+    /// port so the listener can't collide with the host.
     pub fn spawn(
         iface: Interface,
         phy: Phy,
         proxy: std::sync::Arc<dyn crate::proxy::Proxy>,
+        listen_port: u16,
     ) -> NetstackHandle {
         let (accepted_tx, mut accepted_rx) = mpsc::channel(64);
         let (stop_tx, stop_rx) = mpsc::channel::<()>(1);
 
         // Build the actor against the shared channels.
-        let actor = Self::with_channels(iface, phy, accepted_tx, stop_rx);
+        let actor = Self::with_channels(iface, phy, accepted_tx, stop_rx, listen_port);
 
         // The actor poll loop — the gVisor dispatcher equivalent. When the
         // runtime sends stop, this breaks, dropping `accepted_tx`.
@@ -331,14 +361,16 @@ impl NetstackActor {
 
 // ---- helpers ---------------------------------------------------------------
 
-/// Create a fresh listening socket and add it to the set.
-fn add_listener(sockets: &mut SocketSet<'static>) -> SocketHandle {
+/// Create a fresh listening socket on `listen_port` and add it to the set.
+fn add_listener(sockets: &mut SocketSet<'static>, listen_port: u16) -> SocketHandle {
     let mut s = super::new_tcp_socket(TCP_RX_BUF, TCP_TX_BUF);
-    // Listen on any interface. Note: smoltcp requires a concrete, non-zero port
-    // to listen on — see the module-level design note about per-destination
-    // listeners. We listen on a placeholder port here; the scaffold proves the
-    // data path, and TODO(smoltcp) above covers the wildcard extension.
-    let _ = s.listen((smoltcp::wire::IpAddress::v4(0, 0, 0, 0), 1080u16));
+    // Listen on a wildcard address: smoltcp's `listen(port)` (the `From<u16>`
+    // for `ListenEndpoint`) sets `addr = None`, which matches SYNs to *any*
+    // destination IP. That is the closest the fixed-port model gets to gVisor's
+    // NewForwarder behaviour — it still constrains connections to a single port
+    // (the per-destination `TODO(smoltcp)` above lifts that too), but at least
+    // any source/destination IP pair is accepted.
+    let _ = s.listen(listen_port);
     sockets.add(s)
 }
 

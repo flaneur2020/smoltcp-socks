@@ -23,9 +23,13 @@ pub struct ConnMeta {
 
 /// Requests the relay sends to the actor for a given virtual connection.
 pub enum ConnCmd {
+    /// Read up to `max_len` bytes from the virtual socket. The actor returns the
+    /// *bytes actually read* (not just a count): because the smoltcp socket
+    /// lives in the actor, the data can't be written back into the caller's
+    /// buffer, so it travels through the reply channel instead.
     Read {
-        buf: Vec<u8>,
-        reply: oneshot::Sender<Result<usize, VConnError>>,
+        max_len: usize,
+        reply: oneshot::Sender<Result<Vec<u8>, VConnError>>,
     },
     Write {
         data: Vec<u8>,
@@ -80,13 +84,10 @@ impl VConn {
         self.meta.dst
     }
 
-    pub async fn read(&self, buf: &mut [u8]) -> Result<usize, VConnError> {
+    pub async fn read(&self, max_len: usize) -> Result<Vec<u8>, VConnError> {
         let (tx, rx) = oneshot::channel();
         self.cmd
-            .send(ConnCmd::Read {
-                buf: buf.to_vec(),
-                reply: tx,
-            })
+            .send(ConnCmd::Read { max_len, reply: tx })
             .await
             .map_err(|_| VConnError::ActorGone)?;
         rx.await.map_err(|_| VConnError::ActorGone)?
