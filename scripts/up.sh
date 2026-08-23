@@ -23,14 +23,18 @@ set -euo pipefail
 DST="${DST:-172.66.0.227}"                       # destination to capture
 PROXY="${PROXY:-socks5://127.0.0.1:7890}"        # upstream SOCKS5 proxy
 TUN_ADDR="${TUN_ADDR:-198.18.0.1/30}"            # point-to-point addr on the utun
-TUN_REMOTE="${TUN_REMOTE:-198.18.0.2}"           # far end of the /30 (route gateway)
+TUN_REMOTE="${TUN_REMOTE:-198.18.0.2}"           # far end of the /30 (addressed at the utun)
 MTU="${MTU:-1500}"                               # utun MTU
 LOG_LEVEL="${LOG_LEVEL:-info}"                   # trace|debug|info|warn|error
 UTUN="${UTUN:-}"                                 # e.g. utun9; empty ⇒ kernel picks
 
-# The gateway the kernel uses for $DST is the far end of the utun's /30. The
-# `-ifscope $DEV` form does not need a reachable next-hop, but using the far end
-# keeps `netstat -rn` output honest.
+# The gateway the kernel uses for $DST is the far end of the utun's /30 — used
+# for the point-to-point address config below. NOTE: the host route itself uses
+# `-interface $DEV` (not a gateway): macOS `-ifscope` routes are scoped and
+# ignored by unscoped lookups (i.e. by real traffic and `route get`), so they do
+# NOT capture traffic into the utun. A `-interface` route on a point-to-point
+# link sends packets for $DST straight out the utun, and an unscoped lookup
+# (real apps, `route get`) honors it.
 TUN_GW="$TUN_REMOTE"
 
 # --- state files -----------------------------------------------------------
@@ -43,6 +47,7 @@ c_grn() { [ -t 2 ] && printf '\033[32m%s\033[0m' "$1" || printf '%s' "$1"; }
 c_ylw() { [ -t 2 ] && printf '\033[33m%s\033[0m' "$1" || printf '%s' "$1"; }
 
 die() { printf '%s: %s\n' "$(c_red 'error')" "$*" >&2; exit 1; }
+# (note: $* joins args with IFS — a space by default — so multi-arg die works.)
 
 # --- preflight -------------------------------------------------------------
 [ "$(uname -s)" = "Darwin" ] || die "this script targets macOS (got $(uname -s))"
@@ -107,7 +112,10 @@ for _ in $(seq 1 40); do
         rm -f "$PIDFILE"
         die "smoltcp-socks exited during startup — see $LOGFILE above"
     fi
-    line=$(grep -E '\[TUN\] opened [A-Za-z0-9]+' "$LOGFILE" 2>/dev/null | tail -n1)
+    # `|| true` + no pipefail here: grep returns 1 (no match yet) on early
+    # iterations, and under `set -o pipefail` that would abort the script
+    # before the log line ever appears.
+    line=$( { grep -E '\[TUN\] opened [A-Za-z0-9]+' "$LOGFILE" 2>/dev/null || true; } | tail -n1)
     if [ -n "$line" ]; then
         DEVNAME=$(printf '%s' "$line" | sed -E 's/.*\[TUN\] opened ([A-Za-z0-9]+).*/\1/')
         break
@@ -119,21 +127,39 @@ echo "$DEVNAME" >"$DEVFILE"
 
 # --- configure the utun ----------------------------------------------------
 # Assign the point-to-point address and bring the interface up. macOS utuns
-# start IFF_UP; this sets the address (the + alias keeps it from erroring if a
-# stale config lingers).
-ifconfig "$DEVNAME" inet "$TUN_ADDR" "$TUN_REMOTE" up || die "ifconfig $DEVNAME failed"
+# start IFF_UP; this sets the address. `set +e` around these so we can report
+# the EXACT failing command (the generic `|| die` swallowed the real error).
+set +e
+ifconfig "$DEVNAME" inet "$TUN_ADDR" "$TUN_REMOTE" up
+if [ $? -ne 0 ]; then
+    die "ifconfig $DEVNAME inet $TUN_ADDR $TUN_REMOTE up failed" \
+        "(is another process holding $DEVNAME? check: ps aux | grep smoltcp-socks)"
+fi
 
-# /32 host route for $DST, scoped to the utun. A host route is more specific
-# than any broader default/prefix, so it captures app traffic for $DST into the
-# forwarder regardless of the default route. No exclusion route: the proxy
-# dials a *remote* upstream (not $DST itself), so its egress traffic takes the
-# normal default route and never re-enters the utun.
-route add -host "$DST" -gateway "$TUN_GW" -ifscope "$DEVNAME" >/dev/null \
-    || die "route add -host $DST via $DEVNAME failed"
+# /32 host route for $DST, pointed at the utun. On a point-to-point link the
+# `-interface $DEV` form (per `man route`) keeps the route valid and — crucially
+# — is an UNSCOPED route, so real app traffic and `route get $DST` honor it.
+# (The `-ifscope` form is scoped: it's ignored by unscoped lookups, so it would
+# NOT actually capture traffic into the utun — `route get` would still say en0.)
+# A host route is more specific than any broader default/prefix, so it wins for
+# $DST regardless of the default route. No exclusion route: the proxy dials a
+# *remote* upstream (not $DST itself), so its egress takes the normal default
+# route and never re-enters the utun.
+route add -host "$DST" -interface "$DEVNAME" >/dev/null
+if [ $? -ne 0 ]; then
+    # A stale host route from a crashed previous run may already claim $DST;
+    # delete it (best-effort, any form) then re-add.
+    route delete -host "$DST" >/dev/null 2>&1 || true
+    route delete -host "$DST" -interface "$DEVNAME" >/dev/null 2>&1 || true
+    route add -host "$DST" -interface "$DEVNAME" >/dev/null \
+        || die "route add -host $DST -interface $DEVNAME failed" \
+               "(existing route? check: netstat -rn | grep $DST)"
+fi
+set -e
 
 # --- done ------------------------------------------------------------------
 printf '%s forwarding %s → %s via %s (pid %s, %s)\n' \
     "$(c_grn '✓')" "$DST" "$PROXY" "$DEVNAME" "$PID" "$LOGFILE"
 printf '    %s  %s\n' "$(c_grn '✓')" "utun $DEVNAME configured $TUN_ADDR ↔ $TUN_REMOTE"
-printf '    %s  %s\n' "$(c_grn '✓')" "host route: $DST → $TUN_GW @ $DEVNAME"
+printf '    %s  %s\n' "$(c_grn '✓')" "host route: $DST → $DEVNAME (-interface)"
 printf '    stop with: scripts/down.sh\n'

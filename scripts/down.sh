@@ -15,8 +15,6 @@ PIDFILE="/tmp/smoltcp-socks.pid"
 DEVFILE="/tmp/smoltcp-socks.utun"
 
 DST="${DST:-172.66.0.227}"
-TUN_REMOTE="${TUN_REMOTE:-198.18.0.2}"
-TUN_GW="$TUN_REMOTE"
 
 GRACE_TIMEOUT=6   # seconds to wait for a clean SIGINT shutdown
 
@@ -60,13 +58,13 @@ elif [ -n "${PID:-}" ]; then
     ok "pid $PID not running (already gone)"
 fi
 
-# Best-effort route removal. `-ifscope` must match exactly what up.sh added.
+# Best-effort route removal. up.sh installs an unscoped
+# `-host $DST -interface $DEVNAME` route; remove it. Try a couple of forms in
+# case the interface is already gone (the process may have exited first).
 if [ -n "${DEVNAME:-}" ]; then
-    if route delete -host "$DST" -gateway "$TUN_GW" -ifscope "$DEVNAME" >/dev/null 2>&1; then
-        ok "removed host route: $DST → $TUN_GW @ $DEVNAME"
-    else
-        note "host route for $DST @ $DEVNAME already absent (ok)"
-    fi
+    route delete -host "$DST" -interface "$DEVNAME" >/dev/null 2>&1 \
+        || route delete -host "$DST" >/dev/null 2>&1 || true
+    ok "removed host route for $DST (if present)"
 fi
 
 # The utun is torn down by the kernel when the owning process exits; no manual

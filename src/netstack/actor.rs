@@ -53,6 +53,7 @@ use smoltcp::socket::tcp::{RecvError, SendError, Socket as TcpSocket, State};
 use smoltcp::time::Instant;
 use smoltcp::wire::{IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket};
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
@@ -109,6 +110,19 @@ pub struct NetstackActor {
     sockets: SocketSet<'static>,
     /// Pending commands per connection, keyed by socket handle.
     pending: HashMap<SocketHandle, mpsc::Receiver<ConnCmd>>,
+    /// Read/Write requests that could not be completed this cycle because the
+    /// smoltcp socket had nothing to dequeue (read) or no free tx space
+    /// (write). smoltcp's `recv_slice`/`send_slice` return `Ok(0)` when the
+    /// buffer is empty/full but the connection is still open — that is **not**
+    /// EOF, so we must not reply to the relay yet. Instead we stash the reply
+    /// here and retry it on subsequent [`service_commands`] cycles until the
+    /// socket delivers (or closes). This makes `VConn::read`/`write` block as
+    /// the relay expects, instead of spuriously truncating the stream.
+    ///
+    /// At most one pending IO per connection (a relay naturally serializes its
+    /// read loop and its write loop), so this is a single optional slot, not a
+    /// queue.
+    pending_io: HashMap<SocketHandle, PendingIo>,
     /// Idle listening sockets, grouped by the destination port each listens on.
     /// Each socket accepts exactly one connection before leaving the LISTEN
     /// state, so its pool is replenished as connections arrive. Entries are
@@ -122,6 +136,39 @@ pub struct NetstackActor {
     /// Where accepted connections are delivered.
     accepted_tx: mpsc::Sender<(VConn, ConnMeta)>,
     stop: mpsc::Receiver<()>,
+}
+
+/// A relay read/write request parked until the smoltcp socket can satisfy it
+/// (see [`NetstackActor::pending_io`]).
+enum PendingIo {
+    /// Waiting for `recv_slice` to return >0 bytes (or the socket to close).
+    Read {
+        max_len: usize,
+        reply: oneshot::Sender<Result<Vec<u8>, VConnError>>,
+    },
+    /// Waiting for `send_slice` to enqueue >0 bytes (or the socket to close).
+    /// `offset` is how many bytes of `data` have already been accepted; the
+    /// relay retries the unsent tail until it's fully written, so we keep the
+    /// whole buffer and the running offset.
+    Write {
+        data: Vec<u8>,
+        offset: usize,
+        reply: oneshot::Sender<Result<usize, VConnError>>,
+    },
+}
+
+impl PendingIo {
+    /// Resolve a parked request with an error (connection closed/dropped).
+    fn fail(self, err: VConnError) {
+        match self {
+            PendingIo::Read { reply, .. } => {
+                let _ = reply.send(Err(err));
+            }
+            PendingIo::Write { reply, .. } => {
+                let _ = reply.send(Err(err));
+            }
+        }
+    }
 }
 
 impl NetstackActor {
@@ -163,6 +210,7 @@ impl NetstackActor {
             phy,
             sockets,
             pending: HashMap::new(),
+            pending_io: HashMap::new(),
             listeners,
             raw_socket,
             accepted_tx,
@@ -395,8 +443,17 @@ impl NetstackActor {
 
     /// Drain pending commands from each connection and apply them to its socket.
     fn service_commands(&mut self) {
-        // Collect handles whose command channel has closed so we can drop them,
-        // and gather all pending commands. We do this in one pass so `apply_cmd`
+        // 1. Retry IO parked on a previous cycle (read-no-data / write-no-room).
+        // `poll` has just delivered fresh bytes / freed tx space, so a parked
+        // request may now complete. Take the map out of `self` so the re-attempt
+        // (which borrows `self.sockets`) doesn't alias `self.pending_io`.
+        let parked = std::mem::take(&mut self.pending_io);
+        for (handle, io) in parked {
+            self.attempt_parked(handle, io);
+        }
+
+        // 2. Collect handles whose command channel has closed so we can drop
+        // them, and gather all newly-arrived commands. One pass so `apply_cmd`
         // (which mutably borrows `self.sockets`) does not alias the borrow of
         // `self.pending` held by the iterator.
         let mut dead = Vec::new();
@@ -413,6 +470,10 @@ impl NetstackActor {
             self.apply_cmd(handle, cmd);
         }
         for h in dead {
+            // Fail any still-parked IO for this connection before removing it.
+            if let Some(io) = self.pending_io.remove(&h) {
+                io.fail(VConnError::Closed);
+            }
             self.pending.remove(&h);
             self.sockets.get_mut::<TcpSocket>(h).abort();
             let _ = self.sockets.remove(h);
@@ -420,36 +481,135 @@ impl NetstackActor {
         }
     }
 
+    /// Re-attempt a parked read/write against its socket. If it still can't be
+    /// satisfied (no data / no room, socket still open), re-park it. If the
+    /// socket closed, reply with EOF/error. Otherwise complete the request.
+    fn attempt_parked(&mut self, handle: SocketHandle, io: PendingIo) {
+        match io {
+            PendingIo::Read { max_len, reply } => {
+                self.do_read(handle, max_len, reply);
+            }
+            PendingIo::Write {
+                data,
+                offset,
+                reply,
+            } => {
+                self.do_write(handle, data, offset, reply);
+            }
+        }
+    }
+
     fn apply_cmd(&mut self, handle: SocketHandle, cmd: ConnCmd) {
-        let s = self.sockets.get_mut::<TcpSocket>(handle);
+        // The relay serializes its read loop and its write loop, but a brand-new
+        // command can still arrive for a connection that has a parked request of
+        // the other kind. A parked request of the *same* kind should never
+        // happen (the relay awaits each reply before issuing the next); if it
+        // somehow does, fail the old one rather than silently dropping a reply.
+        if let Some(existing) = self.pending_io.remove(&handle) {
+            match (&existing, &cmd) {
+                (PendingIo::Read { .. }, ConnCmd::Read { .. })
+                | (PendingIo::Write { .. }, ConnCmd::Write { .. }) => {
+                    existing.fail(VConnError::Closed);
+                }
+                _ => {
+                    self.pending_io.insert(handle, existing);
+                }
+            }
+        }
+
         match cmd {
-            ConnCmd::Read { max_len, reply } => {
-                let mut buf = vec![0u8; max_len];
-                let res = match s.recv_slice(&mut buf) {
-                    Ok(0) => Ok(Vec::new()),
-                    Ok(n) => {
-                        buf.truncate(n);
-                        Ok(buf)
-                    }
-                    Err(RecvError::Finished) => Ok(Vec::new()),
-                    Err(RecvError::InvalidState) => Err(VConnError::Closed),
-                };
-                let _ = reply.send(res);
-            }
-            ConnCmd::Write { data, reply } => {
-                let res = match s.send_slice(&data) {
-                    Ok(n) => Ok(n),
-                    Err(SendError::InvalidState) => Err(VConnError::Closed),
-                };
-                let _ = reply.send(res);
-            }
+            ConnCmd::Read { max_len, reply } => self.do_read(handle, max_len, reply),
+            ConnCmd::Write { data, reply } => self.do_write(handle, data, 0, reply),
             ConnCmd::CloseWrite { reply } => {
-                s.close(); // returns ()
+                self.sockets.get_mut::<TcpSocket>(handle).close();
                 let _ = reply.send(Ok(()));
             }
             ConnCmd::Close { reply } => {
-                s.abort();
+                if let Some(io) = self.pending_io.remove(&handle) {
+                    io.fail(VConnError::Closed);
+                }
+                self.sockets.get_mut::<TcpSocket>(handle).abort();
                 let _ = reply.send(Ok(()));
+            }
+        }
+    }
+
+    /// Serve one read. Completes the `reply` immediately if data is available or
+    /// the socket is EOF/closed; otherwise parks it in `pending_io` to retry
+    /// next cycle. See [`PendingIo`] for why `Ok(0)` is not EOF.
+    fn do_read(
+        &mut self,
+        handle: SocketHandle,
+        max_len: usize,
+        reply: oneshot::Sender<Result<Vec<u8>, VConnError>>,
+    ) {
+        let s = self.sockets.get_mut::<TcpSocket>(handle);
+        let mut buf = vec![0u8; max_len];
+        match s.recv_slice(&mut buf) {
+            Ok(0) => {
+                // No data buffered right now. If the socket can still receive,
+                // this is a "would block", not EOF — park and retry. If it can't
+                // (e.g. half-closed), `recv_slice` would have returned
+                // `Err(Finished)` instead, so reaching here means still-open.
+                if s.may_recv() {
+                    self.pending_io
+                        .insert(handle, PendingIo::Read { max_len, reply });
+                } else {
+                    let _ = reply.send(Ok(Vec::new()));
+                }
+            }
+            Ok(n) => {
+                buf.truncate(n);
+                let _ = reply.send(Ok(buf));
+            }
+            Err(RecvError::Finished) => {
+                let _ = reply.send(Ok(Vec::new()));
+            }
+            Err(RecvError::InvalidState) => {
+                let _ = reply.send(Err(VConnError::Closed));
+            }
+        }
+    }
+
+    /// Serve one write of `data[offset..]`. Completes the `reply` with the count
+    /// once at least one byte is enqueued (the relay retries the remainder), or
+    /// parks it if the tx buffer is full but the socket is still sendable.
+    fn do_write(
+        &mut self,
+        handle: SocketHandle,
+        data: Vec<u8>,
+        offset: usize,
+        reply: oneshot::Sender<Result<usize, VConnError>>,
+    ) {
+        let s = self.sockets.get_mut::<TcpSocket>(handle);
+        match s.send_slice(&data[offset..]) {
+            Ok(0) => {
+                // Tx buffer full. If we can still send, park and retry once
+                // `poll` drains it; otherwise the connection is closing.
+                if s.may_send() {
+                    self.pending_io.insert(
+                        handle,
+                        PendingIo::Write {
+                            data,
+                            offset,
+                            reply,
+                        },
+                    );
+                } else {
+                    let _ = reply.send(Err(VConnError::Closed));
+                }
+            }
+            Ok(n) => {
+                // Reply with the number of freshly-accepted bytes. If only part
+                // of the tail was accepted, the relay will issue another Write
+                // for the remainder; we don't park-and-continue here because the
+                // relay already handles partial writes by retrying, and keeping
+                // ownership of `data` across cycles would complicate the
+                // contract. The single-cycle `Ok(n>0)` reply is enough.
+                let _ = reply.send(Ok(n));
+            }
+            Err(SendError::InvalidState) => {
+                let _ = reply.send(Err(VConnError::Closed));
             }
         }
     }
