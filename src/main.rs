@@ -5,22 +5,14 @@
 //!  * `engine.Insert(key)` + `engine.Start()` (here: `Runtime::start`),
 //!  * wait for SIGINT/SIGTERM, then `engine.Stop()`.
 
-mod config;
-mod device;
-mod netstack;
-mod proxy;
-mod relay;
-mod runtime;
-mod socks5;
-
 use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use crate::config::Config;
-use crate::runtime::Runtime;
+use smoltcp_socks::config::Config;
+use smoltcp_socks::runtime::Runtime;
 
 /// Userspace TCP/IP stack forwarding TUN connections to a SOCKS5 proxy.
 #[derive(Parser, Debug)]
@@ -65,10 +57,14 @@ impl std::str::FromStr for HumantimeDuration {
         // Accept plain seconds ("60") or "Ns" form ("60s").
         let s = s.trim();
         if let Some(num) = s.strip_suffix('s') {
-            let v: u64 = num.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+            let v: u64 = num
+                .parse()
+                .map_err(|e: std::num::ParseIntError| e.to_string())?;
             return Ok(Self(Duration::from_secs(v)));
         }
-        let v: u64 = s.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+        let v: u64 = s
+            .parse()
+            .map_err(|e: std::num::ParseIntError| e.to_string())?;
         Ok(Self(Duration::from_secs(v)))
     }
 }
@@ -93,18 +89,20 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
         )
         .init();
 
     let cfg = args.into_config();
     let rt = Runtime::start(&cfg)?;
-    let _ = rt;
 
     // Wait for Ctrl-C / SIGTERM — mirrors tun2socks' signal.Notify loop.
     tokio::signal::ctrl_c().await?;
     tracing::info!("[MAIN] received interrupt, shutting down");
+
+    // Cleanly tear down the actor + relay dispatcher — mirrors
+    // `engine.Stop()` closing the stack and waiting for it to drain.
+    rt.shutdown().await;
 
     Ok(())
 }

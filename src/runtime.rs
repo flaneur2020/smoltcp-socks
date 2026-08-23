@@ -19,7 +19,9 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::device::{DeviceHandles, Phy};
-use crate::netstack::{NetstackActor, NetstackHandle, build_interface, resolve_mtu};
+use crate::netstack::{
+    DEFAULT_LISTEN_PORT, NetstackActor, NetstackHandle, build_interface, resolve_mtu,
+};
 use crate::proxy::{Proxy, ProxyUrl};
 
 /// The running program. `shutdown` stops everything cleanly.
@@ -51,7 +53,7 @@ impl Runtime {
         let iface = build_interface(&mut phy);
 
         // 4. Spawn the netstack actor + relay dispatcher.
-        let handle = NetstackActor::spawn(iface, phy, proxy.clone());
+        let handle = NetstackActor::spawn(iface, phy, proxy.clone(), DEFAULT_LISTEN_PORT);
 
         // 5. Spawn the TUN pump: read packets from the fd → `inbound`, and write
         //    `outbound` packets back to the fd. This is the async counterpart of
@@ -73,7 +75,10 @@ impl Runtime {
 ///
 /// Inbound: `tun.read() → inbound.send()`. Outbound: `outbound.recv() → tun.write()`.
 async fn tun_pump(device_spec: String, _mtu: usize, handles: DeviceHandles) {
-    let DeviceHandles { inbound, mut outbound } = handles;
+    let DeviceHandles {
+        inbound,
+        mut outbound,
+    } = handles;
 
     // Open the TUN device. The `tun` crate exposes an async device behind its
     // `async` feature; this scaffold leaves the concrete create call as a
@@ -131,9 +136,7 @@ fn open_tun(spec: &str) -> Result<AsyncTun> {
         .or_else(|| spec.strip_prefix("utun://"))
         .unwrap_or(spec);
     let mut cfg = tun::Configuration::default();
-    cfg.up()
-        .tun_name(name)
-        .mtu(1500);
+    cfg.up().tun_name(name).mtu(1500);
 
     tun::create_as_async(&cfg).map_err(|e| anyhow!("create tun: {e}"))
 }

@@ -8,7 +8,7 @@
 use std::net::SocketAddr;
 
 use thiserror::Error;
-use tokio::sync::{oneshot, mpsc};
+use tokio::sync::{mpsc, oneshot};
 
 /// The original-destination metadata, equivalent to the
 /// `stack.TransportEndpointID` tun2socks attaches to each connection.
@@ -23,9 +23,13 @@ pub struct ConnMeta {
 
 /// Requests the relay sends to the actor for a given virtual connection.
 pub enum ConnCmd {
+    /// Read up to `max_len` bytes from the virtual socket. The actor returns the
+    /// *bytes actually read* (not just a count): because the smoltcp socket
+    /// lives in the actor, the data can't be written back into the caller's
+    /// buffer, so it travels through the reply channel instead.
     Read {
-        buf: Vec<u8>,
-        reply: oneshot::Sender<Result<usize, VConnError>>,
+        max_len: usize,
+        reply: oneshot::Sender<Result<Vec<u8>, VConnError>>,
     },
     Write {
         data: Vec<u8>,
@@ -46,7 +50,12 @@ pub enum ConnCmd {
 pub enum VConnError {
     #[error("connection closed")]
     Closed,
+    /// Distinct from [`VConnError::Closed`] for a hard RST/abort. The current
+    /// actor maps smoltcp's `InvalidState` to `Closed`; a fuller impl that
+    /// inspects the TCP state would return `Reset` on an RST. Kept so the relay
+    /// can branch on it without an API change later.
     #[error("connection reset")]
+    #[allow(dead_code)]
     Reset,
     #[error("actor stopped")]
     ActorGone,
@@ -75,13 +84,10 @@ impl VConn {
         self.meta.dst
     }
 
-    pub async fn read(&self, buf: &mut [u8]) -> Result<usize, VConnError> {
+    pub async fn read(&self, max_len: usize) -> Result<Vec<u8>, VConnError> {
         let (tx, rx) = oneshot::channel();
         self.cmd
-            .send(ConnCmd::Read {
-                buf: buf.to_vec(),
-                reply: tx,
-            })
+            .send(ConnCmd::Read { max_len, reply: tx })
             .await
             .map_err(|_| VConnError::ActorGone)?;
         rx.await.map_err(|_| VConnError::ActorGone)?

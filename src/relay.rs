@@ -77,13 +77,12 @@ async fn copy_vconn_to<W>(vconn: &VConn, dst: &mut W) -> Result<()>
 where
     W: AsyncWriteExt + Unpin,
 {
-    let mut buf = vec![0u8; RELAY_BUF];
     loop {
-        let n = vconn.read(&mut buf).await?;
-        if n == 0 {
+        let data = vconn.read(RELAY_BUF).await?;
+        if data.is_empty() {
             break;
         }
-        dst.write_all(&buf[..n]).await?;
+        dst.write_all(&data).await?;
     }
     // Half-close the write side, as tun2socks does.
     let _ = dst.flush().await;
