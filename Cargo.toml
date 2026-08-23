@@ -50,8 +50,8 @@ thiserror = "2"
 # default auto-discovery picks up), so declare each as an explicit test target.
 [[test]]
 name = "socks5_e2e"
-path = "integrations/socks5_e2e.rs"
+path = "tests/socks5_e2e.rs"
 
 [[test]]
 name = "tun_e2e"
-path = "integrations/tun_e2e.rs"
+path = "tests/tun_e2e.rs"
