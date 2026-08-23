@@ -8,7 +8,7 @@
 use std::net::SocketAddr;
 
 use thiserror::Error;
-use tokio::sync::{oneshot, mpsc};
+use tokio::sync::{mpsc, oneshot};
 
 /// The original-destination metadata, equivalent to the
 /// `stack.TransportEndpointID` tun2socks attaches to each connection.

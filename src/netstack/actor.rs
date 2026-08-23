@@ -338,10 +338,7 @@ fn add_listener(sockets: &mut SocketSet<'static>) -> SocketHandle {
     // to listen on — see the module-level design note about per-destination
     // listeners. We listen on a placeholder port here; the scaffold proves the
     // data path, and TODO(smoltcp) above covers the wildcard extension.
-    let _ = s.listen((
-        smoltcp::wire::IpAddress::v4(0, 0, 0, 0),
-        1080u16,
-    ));
+    let _ = s.listen((smoltcp::wire::IpAddress::v4(0, 0, 0, 0), 1080u16));
     sockets.add(s)
 }
 
@@ -360,15 +357,13 @@ fn to_socket_addr(ep: smoltcp::wire::IpEndpoint) -> Option<std::net::SocketAddr>
     Some(SocketAddr::new(ip, ep.port))
 }
 
-/// Convert an smoltcp `Duration` to a `std::time::Duration`, clamping negatives
-/// to zero (a past deadline means "poll immediately").
+/// Convert an smoltcp `Duration` to a `std::time::Duration`.
+///
+/// smoltcp's `Duration::millis()` already returns a non-negative `u64`, so no
+/// clamping is needed; a past deadline simply yields a zero duration, which
+/// the poll loop treats as "poll again immediately".
 fn smoltcp_duration_to_std(d: smoltcp::time::Duration) -> Duration {
-    let ms = d.millis();
-    if ms <= 0 {
-        Duration::ZERO
-    } else {
-        Duration::from_millis(ms as u64)
-    }
+    Duration::from_millis(d.millis())
 }
 
 /// A real command receiver is only available after `try_accept` creates one; to

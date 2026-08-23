@@ -91,9 +91,17 @@ pub struct Socks5Proxy {
 }
 
 impl Socks5Proxy {
-    pub fn new(host: String, port: u16, username: Option<String>, password: Option<String>) -> Self {
+    pub fn new(
+        host: String,
+        port: u16,
+        username: Option<String>,
+        password: Option<String>,
+    ) -> Self {
         let creds = match (username, password) {
-            (Some(u), Some(p)) => Some(Credentials { username: u, password: p }),
+            (Some(u), Some(p)) => Some(Credentials {
+                username: u,
+                password: p,
+            }),
             _ => None,
         };
         Self { host, port, creds }

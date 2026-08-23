@@ -83,11 +83,7 @@ pub const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Resolve the effective MTU, defaulting to the standard Ethernet MTU when the
 /// caller leaves it at 0 (mirrors tun2socks' MTU default handling).
 pub fn resolve_mtu(cfg: &Config) -> usize {
-    if cfg.mtu == 0 {
-        1500
-    } else {
-        cfg.mtu as usize
-    }
+    if cfg.mtu == 0 { 1500 } else { cfg.mtu as usize }
 }
 
 /// A TCP socket allocated with heap-backed send/receive buffers. This is the

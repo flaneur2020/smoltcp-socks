@@ -44,3 +44,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # Error ergonomics.
 anyhow = "1"
 thiserror = "2"
+
+# Integration tests live under tests/integrations/ (one level deeper than Cargo's
+# default auto-discovery picks up), so declare each as an explicit test target.
+[[test]]
+name = "socks5_handshake"
+path = "tests/integrations/socks5_handshake.rs"

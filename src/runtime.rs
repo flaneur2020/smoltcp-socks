@@ -73,7 +73,10 @@ impl Runtime {
 ///
 /// Inbound: `tun.read() → inbound.send()`. Outbound: `outbound.recv() → tun.write()`.
 async fn tun_pump(device_spec: String, _mtu: usize, handles: DeviceHandles) {
-    let DeviceHandles { inbound, mut outbound } = handles;
+    let DeviceHandles {
+        inbound,
+        mut outbound,
+    } = handles;
 
     // Open the TUN device. The `tun` crate exposes an async device behind its
     // `async` feature; this scaffold leaves the concrete create call as a
@@ -131,9 +134,7 @@ fn open_tun(spec: &str) -> Result<AsyncTun> {
         .or_else(|| spec.strip_prefix("utun://"))
         .unwrap_or(spec);
     let mut cfg = tun::Configuration::default();
-    cfg.up()
-        .tun_name(name)
-        .mtu(1500);
+    cfg.up().tun_name(name).mtu(1500);
 
     tun::create_as_async(&cfg).map_err(|e| anyhow!("create tun: {e}"))
 }
