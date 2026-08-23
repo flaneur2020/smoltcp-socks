@@ -63,6 +63,14 @@ impl Phy {
             },
         )
     }
+
+    /// Push a packet to the *front* of the inbound queue so the very next
+    /// `receive()` returns it before any channel-buffered packet. Used by the
+    /// netstack actor to re-inject an observed SYN after lazily creating a
+    /// listener for its destination port (see `actor.rs`).
+    pub fn reinject(&mut self, pkt: Packet) {
+        self.inbound_buf.push_front(pkt);
+    }
 }
 
 /// The async side of the bridge: what the TUN pump task holds.

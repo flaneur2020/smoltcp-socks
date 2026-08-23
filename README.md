@@ -39,17 +39,21 @@ feeds the real netstack actor → relay → a real SOCKS5 server → a real echo
 and bytes round-trip correctly. CI runs `cargo fmt --check`, `cargo clippy -D
 warnings`, and `cargo test` on every PR.
 
-Two gaps remain before this is production-ready (both are marked in the code with
+One gap remains before this is production-ready (marked in the code with
 `TODO`):
 
-- **Per-destination SYN interception.** The actor currently listens on a single
-  wildcard-address port. A real TUN carries TCP connections to arbitrary
-  `(ip, port)` pairs; matching those requires intercepting SYNs at the IP layer
-  and creating a listener per destination, the way gVisor's `tcp.NewForwarder`
-  does. This is the hardest porting task.
 - **Windows `wintun` backend.** The TUN open path handles Linux `tun` and macOS
   `utun` (kernel-picked unit when no name is given, or an explicit `utunN`);
   the Windows backend is not yet wired.
+
+Per-destination SYN interception — the gVisor `tcp.NewForwarder` equivalent,
+where a TUN carrying TCP connections to arbitrary `(ip, port)` pairs is
+matched without pre-listening on every port — *is* implemented: an
+all-protocol smoltcp raw socket taps each inbound SYN, suppresses the RST
+that would otherwise fire for an unmatched destination, lazily creates a
+listener pool for the SYN's destination port, and re-injects the SYN so the
+next poll completes the handshake. The lazy path is covered by
+`integrations/tun_e2e.rs::lazy_syn_to_arbitrary_port_is_accepted`.
 
 ## Build
 
@@ -65,3 +69,27 @@ sudo target/debug/smoltcp-socks --device tun:// --proxy socks5://127.0.0.1:1080 
 # macOS with an explicit utun unit
 sudo target/debug/smoltcp-socks --device utun://utun9 --proxy socks5://127.0.0.1:1080
 ```
+
+## Forwarding a destination on macOS
+
+`scripts/up.sh` captures all TCP traffic for a single destination and relays it
+through a SOCKS5 proxy. It builds + launches the binary, configures the utun it
+created, and installs a `/32` host route that pins the destination to the utun.
+
+```sh
+# Capture 172.66.0.227 → socks5://127.0.0.1:7890 (defaults; all overridable
+# via environment: DST, PROXY, TUN_ADDR, TUN_REMOTE, MTU, UTUN, LOG_LEVEL).
+sudo scripts/up.sh
+
+# …use the machine; traffic to 172.66.0.227 is tunneled through the proxy…
+
+# Stop, remove the route, and let the kernel tear down the utun.
+sudo scripts/down.sh
+```
+
+The `/32` host route is more specific than the default route, so it captures app
+traffic for `DST` regardless of the box's normal routing. No proxy-route
+exclusion is added: this assumes the SOCKS5 server forwards to a *remote*
+upstream (not to `DST` itself). If your proxy dials `DST` directly you'll loop
+back into the utun and must exclude the proxy's egress (fwmark / a more-specific
+route for the proxy host) yourself.

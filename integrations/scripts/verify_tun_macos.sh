@@ -12,11 +12,13 @@
 #                                  instead of the crate's opaque `InvalidName`.
 #   5. Each run shuts down cleanly on SIGINT (exit 0).
 #
-# What this does NOT check: a data-path round trip through the TUN. The
-# per-destination SYN interception + fwmark/route-exclusion pieces are still
-# TODOs, so routing a real destination through the utun would loop back into
-# the TUN. The mocked-TUN e2e test (integration/tests/tun_e2e.rs) covers the
-# data path; this script covers the real platform open path.
+# What this does NOT check: a data-path round trip through the real TUN.
+# That needs a route into the utun plus the SOCKS5 egress to leave the box (the
+# proxy forwards to a remote upstream, so its own dial must not loop back into
+# the TUN). The mocked-TUN e2e test (`integrations/tun_e2e.rs`) covers the
+# data path, including the lazy per-destination SYN interception; this script
+# covers the real platform open path. The end-to-end forwarding path through a
+# real utun is driven by `scripts/up.sh` / `scripts/down.sh`.
 #
 # Requirements: macOS, sudo (TUN creation needs root), a SOCKS5 proxy already
 # listening on $SOCKS_PORT (default 7890). The binary is built as the normal

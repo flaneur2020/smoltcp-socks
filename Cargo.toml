@@ -17,6 +17,7 @@ smoltcp = { version = "0.14", default-features = false, features = [
     "socket-tcp",
     "socket-udp",
     "socket-icmp",
+    "socket-raw",
     "async",
     "multicast",
 ] }
@@ -45,12 +46,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 anyhow = "1"
 thiserror = "2"
 
-# Integration tests live under integration/tests/ (one level deeper than Cargo's
+# Integration tests live under integrations/ (one level deeper than Cargo's
 # default auto-discovery picks up), so declare each as an explicit test target.
 [[test]]
-name = "socks5_handshake"
-path = "integration/tests/socks5_handshake.rs"
+name = "socks5_e2e"
+path = "integrations/socks5_e2e.rs"
 
 [[test]]
 name = "tun_e2e"
-path = "integration/tests/tun_e2e.rs"
+path = "integrations/tun_e2e.rs"

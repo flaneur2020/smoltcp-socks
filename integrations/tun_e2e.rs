@@ -1,6 +1,6 @@
-//! End-to-end test through a mocked TUN device and a real SOCKS5 server.
+//! End-to-end tests through a mocked TUN device and a real SOCKS5 server.
 //!
-//! This is the mirror image of `socks5_handshake.rs`: there the proxy side was
+//! This is the mirror image of `socks5_e2e.rs`: there the proxy side was
 //! mocked and the TUN side was real; here the **TUN side is mocked** (a `Phy`
 //! driven by hand-built IP/TCP packets) and the **proxy and target are real**
 //! — a genuine SOCKS5 server proxying to a genuine echo service.
@@ -10,6 +10,13 @@
 //! the test plays the role a real TUN fd + kernel TCP stack would normally
 //! play: it completes a 3-way handshake against the smoltcp listener, then
 //! shuttles application data through it.
+//!
+//! Two cases:
+//!  * `tun_to_socks5_echo_e2e` — the actor is pre-warmed on the destination
+//!    port (the legacy fixed-port model).
+//!  * `lazy_syn_to_arbitrary_port_is_accepted` — the actor is started with
+//!    `LAZY_LISTEN` (no pre-warmed port) and must create a listener on demand
+//!    when it observes the SYN, proving the per-destination SYN interception.
 //!
 //! The data path exercised end to end is:
 //!
@@ -21,11 +28,10 @@
 //!                                                       real echo target
 //! ```
 //!
-//! Because the actor's fixed-port listener (see the `TODO(smoltcp)` note in
-//! `actor.rs`) can only accept a connection to a single `(ip, port)`, the echo
-//! target is bound to the *same* port the actor listens on and the TUN SYN is
-//! addressed to that real address — so the real SOCKS5 CONNECT dials a host
-//! that actually exists.
+//! Because the real SOCKS5 CONNECT must dial a host that actually exists, the
+//! echo target is bound to a real loopback address and the TUN SYN is addressed
+//! to it. The smoltcp listener is virtual, so it never clashes with the OS
+//! socket on the same `(ip, port)`.
 
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -35,11 +41,24 @@ use smoltcp::wire::{
     IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
 };
 use smoltcp_socks::device::{DeviceHandles, Phy};
-use smoltcp_socks::netstack::{NetstackActor, build_interface};
+use smoltcp_socks::netstack::{LAZY_LISTEN, NetstackActor, build_interface};
 use smoltcp_socks::proxy::ProxyUrl;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout};
+
+/// Install a tracing subscriber (once) so debug! logs from the actor surface
+/// under `--nocapture`. No-op after the first call.
+fn init_tracing() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_test_writer()
+            .try_init();
+    });
+}
 
 /// smoltcp 0.14's `Ipv4Address` *is* `core::net::Ipv4Addr`, so an `Ipv4Addr`
 /// lifts directly into an `IpAddress`.
@@ -225,11 +244,10 @@ async fn run_echo_target(listener: TcpListener) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn tun_to_socks5_echo_e2e() {
-    // The actor's fixed-port listener means the TUN SYN's destination must be a
-    // real, dialable address on the *same* port the actor listens on. Bind the
-    // echo target first, take its ephemeral port, and use that as both the
-    // actor listen port and the TUN destination. The smoltcp listener is
-    // virtual, so it does not clash with the OS socket.
+    // This case uses the legacy fixed-port model: the actor is pre-warmed on
+    // `listen_port`. Bind the echo target first, take its ephemeral port, and
+    // use that as both the actor listen port and the TUN destination. The
+    // smoltcp listener is virtual, so it does not clash with the OS socket.
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo_listener.local_addr().unwrap();
     let listen_port = echo_addr.port();
@@ -304,6 +322,96 @@ async fn tun_to_socks5_echo_e2e() {
                 }
             } else if repr.control == TcpControl::Fin {
                 // Peer half-closed; ACK it.
+                client.recv_next += 1;
+                inbound.send(client.segment(&[])).await.unwrap();
+            }
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "timed out waiting for echo; got {got:?}");
+
+    assert_eq!(&got[..payload.len()], payload, "echo round-trip mismatch");
+}
+
+/// The actor is started with `LAZY_LISTEN` (no pre-warmed port) and must create
+/// a TCP listener on demand when it observes the first SYN for a destination
+/// port it has never seen — the per-destination SYN interception path.
+///
+/// The SYN is addressed to an arbitrary port (the echo target's ephemeral port)
+/// that the actor was never told about. Proving the SYN-ACK comes back with
+/// `src_port == dst_port` shows a listener was created lazily; the echo
+/// round-trip proves the lazily-accepted connection relays end to end.
+#[tokio::test(flavor = "current_thread")]
+async fn lazy_syn_to_arbitrary_port_is_accepted() {
+    init_tracing();
+    // The actor will never be told this port — it must discover it from the SYN.
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_listener.local_addr().unwrap();
+    let dst_port = echo_addr.port();
+
+    tokio::spawn(run_echo_target(echo_listener));
+
+    let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_addr = socks_listener.local_addr().unwrap();
+    tokio::spawn(run_socks5_server(
+        socks_listener,
+        std::net::SocketAddr::new(echo_addr.ip(), echo_addr.port()),
+    ));
+
+    let (mut phy, device_handles) = Phy::new(1500);
+    let iface = build_interface(&mut phy);
+    let proxy_url = ProxyUrl::parse(&format!("socks5://127.0.0.1:{}", socks_addr.port())).unwrap();
+    let proxy = std::sync::Arc::new(proxy_url.into_proxy());
+    // LAZY_LISTEN (0): no pre-warmed listener, no hint about dst_port.
+    let _handle = NetstackActor::spawn(iface, phy, proxy, LAZY_LISTEN);
+
+    let DeviceHandles { inbound, outbound } = device_handles;
+    let inbound = inbound;
+    let mut outbound = outbound;
+
+    let dst = match echo_addr.ip() {
+        std::net::IpAddr::V4(v4) => v4,
+        v6 => panic!("expected ipv4 echo target, got {v6}"),
+    };
+    let mut client = TcpClient::new(Ipv4Addr::new(10, 0, 0, 2), 54321, dst, dst_port);
+
+    // --- 3-way handshake (lazy path: two polls — drain + re-inject, then accept) ---
+    inbound.send(client.syn()).await.unwrap();
+    sleep(Duration::from_millis(150)).await;
+
+    let synack = recv_outbound(&mut outbound).await;
+    let synack_repr = parse(&synack);
+    assert_eq!(synack_repr.control, TcpControl::Syn);
+    // The decisive assertion: the actor answered on a port it was never told
+    // about, proving a listener was created lazily from the observed SYN.
+    assert_eq!(synack_repr.src_port, dst_port);
+    assert_eq!(synack_repr.dst_port, 54321);
+    if let Some(mss) = synack_repr.max_seg_size {
+        client.mss = mss as usize;
+    }
+    client.recv_next = synack_repr.seq_number + 1;
+
+    // ACK the SYN-ACK, completing the handshake.
+    inbound.send(client.segment(&[])).await.unwrap();
+    sleep(Duration::from_millis(150)).await;
+
+    // --- Send application data through TUN → relay → proxy → echo ---
+    let payload = b"lazy listener works!";
+    inbound.send(client.segment(payload)).await.unwrap();
+
+    let mut got = Vec::new();
+    let result = timeout(Duration::from_millis(8000), async {
+        loop {
+            let pkt = recv_outbound(&mut outbound).await;
+            let repr = parse(&pkt);
+            if !repr.payload.is_empty() {
+                client.recv_next += repr.payload.len();
+                got.extend_from_slice(repr.payload);
+                inbound.send(client.segment(&[])).await.unwrap();
+                if got.len() >= payload.len() {
+                    return;
+                }
+            } else if repr.control == TcpControl::Fin {
                 client.recv_next += 1;
                 inbound.send(client.segment(&[])).await.unwrap();
             }
