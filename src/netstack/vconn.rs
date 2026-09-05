@@ -67,6 +67,8 @@ pub enum VConnError {
 ///
 /// Cloneable so the two directions of the bidirectional relay (origin→remote,
 /// remote→origin, as in tun2socks' `pipe`) can each hold a copy.
+/// One read and one write may wait concurrently; another request in the same
+/// direction returns `WouldBlock`.
 #[derive(Clone)]
 pub struct VConn {
     pub meta: ConnMeta,
