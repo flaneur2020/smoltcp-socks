@@ -37,7 +37,7 @@ use crate::{config::Config, device::Phy};
 pub mod actor;
 pub mod vconn;
 
-pub use actor::{DEFAULT_LISTEN_PORT, LAZY_LISTEN, NetstackActor, NetstackHandle};
+pub use actor::{NetstackActor, NetstackHandle};
 #[allow(unused_imports)]
 pub use vconn::{VConn, VConnError};
 

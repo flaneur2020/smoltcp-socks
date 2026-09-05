@@ -21,7 +21,7 @@ use tun::AbstractDevice as _;
 
 use crate::config::Config;
 use crate::device::{DeviceHandles, Phy};
-use crate::netstack::{LAZY_LISTEN, NetstackActor, NetstackHandle, build_interface, resolve_mtu};
+use crate::netstack::{NetstackActor, NetstackHandle, build_interface, resolve_mtu};
 use crate::proxy::{Proxy, ProxyUrl};
 
 /// The running program. `shutdown` stops everything cleanly.
@@ -52,11 +52,8 @@ impl Runtime {
         // 3. Build the smoltcp interface — tun2socks' `core.CreateStack`.
         let iface = build_interface(&mut phy);
 
-        // 4. Spawn the netstack actor + relay dispatcher. LAZY_LISTEN (0) means
-        //    a wildcard-port listener pool: sockets `listen` on `IpListenPort::Any`
-        //    and accept a SYN to any `(ip, port)` — the gVisor NewForwarder
-        //    equivalent, no port known in advance.
-        let handle = NetstackActor::spawn(iface, phy, proxy.clone(), LAZY_LISTEN);
+        // 4. Accept arbitrary destinations and relay each connection through SOCKS5.
+        let handle = NetstackActor::spawn(iface, phy, proxy.clone());
 
         // 5. Spawn the TUN pump: read packets from the fd → `inbound`, and write
         //    `outbound` packets back to the fd. This is the async counterpart of

@@ -15,8 +15,8 @@
 # What this does NOT check: a data-path round trip through the real TUN.
 # That needs a route into the utun plus the SOCKS5 egress to leave the box (the
 # proxy forwards to a remote upstream, so its own dial must not loop back into
-# the TUN). The mocked-TUN e2e test (`integrations/tun_e2e.rs`) covers the
-# data path, including the lazy per-destination SYN interception; this script
+# the TUN). The mocked-TUN e2e test (`tests/tun_e2e.rs`) covers the
+# data path, including the wildcard-port listening; this script
 # covers the real platform open path. The end-to-end forwarding path through a
 # real utun is driven by `scripts/up.sh` / `scripts/down.sh`.
 #

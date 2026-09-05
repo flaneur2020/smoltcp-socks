@@ -23,11 +23,10 @@ each one through the proxy.
 3. When a TCP handshake completes, the connection is handed to a relay task.
 4. The relay opens a SOCKS5 tunnel to the upstream and copies bytes both ways.
 
-The one wrinkle worth knowing: a real TUN carries connections to **any**
-`(ip, port)` destination, but smoltcp only listens on ports you've named. So
-the actor taps every inbound SYN through an all-protocol raw socket, lazily
-creates a listener for whatever destination port shows up, and re-injects the
-SYN so the handshake completes. No port has to be configured in advance.
+The actor uses `IpListenEndpoint::ANY_PORT` to accept TCP connections to any
+destination address and port. Each accepted socket retains the original
+destination for SOCKS5 CONNECT. A pool of four listeners is replenished as
+handshakes complete; at most four pending handshakes fit in the pool at once.
 
 ## Status
 
@@ -35,10 +34,16 @@ The data path works end to end and is covered by integration tests (mocked
 TUN → real netstack → real SOCKS5 → real echo, with bytes round-tripping).
 CI runs `cargo fmt --check`, `cargo clippy -D warnings`, and `cargo test`.
 
+UDP forwarding is not implemented yet.
+
 Linux `tun` and macOS `utun` are supported. The Windows `wintun` backend is
 the one missing piece.
 
 ## Build
+
+The smoltcp dependency uses the `feat/allow-listen-any` branch of
+[flaneur2020/smoltcp](https://github.com/flaneur2020/smoltcp/tree/feat/allow-listen-any).
+`Cargo.lock` pins the revision, so no sibling checkout is required.
 
 ```sh
 cargo build

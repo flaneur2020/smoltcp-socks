@@ -6,10 +6,11 @@ description = "A userspace TCP/IP stack (smoltcp) that forwards TUN connections 
 license = "Apache-2.0"
 
 [dependencies]
+# The wildcard-listen branch supplies IpListenEndpoint::ANY_PORT.
 # Userspace TCP/IP stack. We use the std + async feature set: IPv4/IPv6, TCP/UDP
 # sockets, and the async waker API so each virtual connection can present an
 # AsyncRead/AsyncWrite surface without blocking the single poll loop.
-smoltcp = { path = "../smoltcp", default-features = false, features = [
+smoltcp = { git = "https://github.com/flaneur2020/smoltcp.git", branch = "feat/allow-listen-any", default-features = false, features = [
     "std",
     "medium-ip",
     "proto-ipv4",
